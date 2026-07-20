@@ -5,6 +5,7 @@ A desktop tone-mapping tool for people who care which curve they're using. Stand
 ![platform](https://img.shields.io/badge/platform-Windows-informational)
 ![python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
+![grandma approved](https://img.shields.io/badge/grandma-approved-ff69b4)
 
 **[Website](https://godysdev.github.io/Open-HDR-to-SDR-convertor/)** · **[Latest release](https://github.com/godysdev/Open-HDR-to-SDR-convertor/releases/latest)**
 
@@ -12,9 +13,11 @@ A desktop tone-mapping tool for people who care which curve they're using. Stand
 
 ## Why
 
-If you're just a user who wants to convert HDR to SDR, you shouldn't have to learn FFmpeg first.
-Right now the choice is usually one of two extremes: paid software with a clean interface, or FFmpeg/HandBrake — free, powerful, and accurate, but built for people who already know what BT.2390 means and are comfortable on a command line. There isn't much in between.
-This app is built to be that middle ground. It does exactly one job — turning HDR into SDR — using nothing but your own hardware and open-source tools that already do it well: FFmpeg, libplacebo/Vulkan, and optionally HandBrakeCLI. No subscription, no cloud processing, no black-box "auto" button standing in for a real answer. Just a normal window: pick a curve, pick an encoder, hit start, and see the exact command that ran.
+Good HDR→SDR tone mapping shouldn't cost money, and it shouldn't require learning FFmpeg first.
+
+Right now the choice is usually one of two extremes: paid software with a clean interface, or FFmpeg/HandBrake — free, powerful, and correct, but built for people who already know what BT.2390 means and are comfortable on a command line. There's not much in between.
+
+This app is built to be that middle ground. It does exactly one job — HDR to SDR — and does it using nothing but your own hardware and open-source tools already capable of doing it right (FFmpeg, libplacebo/Vulkan, optionally HandBrakeCLI). No subscription, no cloud processing, no black-box "auto" button standing in for a real answer. Just a normal window: pick a curve, pick an encoder, hit start, and see the exact command that ran.
 
 ## Backends
 
