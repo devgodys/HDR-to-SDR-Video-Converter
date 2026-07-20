@@ -13,7 +13,7 @@ A desktop tone-mapping tool for people who care which curve they're using. Stand
 
 ## Why
 
-Good HDR→SDR tone mapping shouldn't cost money, and it shouldn't require learning FFmpeg first.
+If you're just a user who wants to convert HDR to SDR, you shouldn't have to learn FFmpeg first.
 
 Right now the choice is usually one of two extremes: paid software with a clean interface, or FFmpeg/HandBrake — free, powerful, and correct, but built for people who already know what BT.2390 means and are comfortable on a command line. There's not much in between.
 
