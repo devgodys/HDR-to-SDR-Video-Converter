@@ -12,7 +12,9 @@ A desktop tone-mapping tool for people who care which curve they're using. Stand
 
 ## Why
 
-Most HDR→SDR tools hide the tone-mapping curve behind an "auto" setting. This one doesn't — you pick the backend and curve, and the exact command line that runs is always visible in the log, so you know precisely what happened to your footage.
+Good HDR-to-SDR tone mapping shouldn't cost money, and it shouldn't require learning FFmpeg first.
+Right now the choice is usually one of two extremes: paid software with a clean interface, or FFmpeg/HandBrake — free, powerful, and accurate, but built for people who already know what BT.2390 means and are comfortable on a command line. There isn't much in between.
+This app is built to be that middle ground. It does exactly one job — turning HDR into SDR — using nothing but your own hardware and open-source tools that already do it well: FFmpeg, libplacebo/Vulkan, and optionally HandBrakeCLI. No subscription, no cloud processing, no black-box "auto" button standing in for a real answer. Just a normal window: pick a curve, pick an encoder, hit start, and see the exact command that ran.
 
 ## Backends
 
