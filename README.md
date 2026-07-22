@@ -32,6 +32,7 @@ Three genuinely different pipelines, not one "auto" button:
 ## Features
 
 - **True BT.2390 tone mapping** via libplacebo/Vulkan — not a CPU approximation
+- **10-bit & 12-bit output** — free, no license. 10-bit works with any H.265 encoder (CPU or hardware); 12-bit is CPU libx265 only, since no common hardware encoder does 12-bit HEVC
 - **Full curve library** — Hable, Reinhard, Mobius, BT.2446A, ST2094-10/40, Linear, Gamma, Clip, None
 - **Hardware encoding** — CPU (x264/x265), NVIDIA NVENC, AMD AMF, Apple VideoToolbox
 - **Resolution presets** — Source, 4K, 1440p, 1080p, 720p, 480p, or custom width/height
@@ -67,6 +68,14 @@ python hdr_to_sdr_gui_qt.py
 
 Or grab a prebuilt Windows `.exe` from the [latest release](https://github.com/godysdev/Open-HDR-to-SDR-convertor/releases/latest) — no Python required, though FFmpeg is still needed separately.
 
+### 10-bit / 12-bit output
+
+`hdr_to_sdr_gui_qt.py` outputs standard 8-bit SDR. For 10-bit or 12-bit output, run `hdr_to_sdr_pro_gui_qt.py` instead — it's a thin subclass of the same app that adds a bit-depth selector and filters the encoder list to whatever actually supports the depth you picked. Same requirements, same window, one extra dropdown; free, no license needed.
+
+```bash
+python hdr_to_sdr_pro_gui_qt.py
+```
+
 ## Basic workflow
 
 1. Pick a **Source** HDR file and an **SDR output** path, then click **Analyze**.
@@ -84,6 +93,8 @@ pyinstaller --windowed --onefile --icon=icon.ico hdr_to_sdr_gui_qt.py
 
 Drop `icon.ico` next to the script beforehand and it's picked up automatically, both in-app and as the exe's file icon.
 
+Swap `hdr_to_sdr_gui_qt.py` for `hdr_to_sdr_pro_gui_qt.py` in the command above to build the 10/12-bit version instead — same flags, same icon, just a different entry point.
+
 ## Troubleshooting
 
 - **BT.2390 (GPU) option greyed out** — no Vulkan-capable device was detected; use a Standard FFmpeg curve instead.
@@ -92,7 +103,7 @@ Drop `icon.ico` next to the script beforehand and it's picked up automatically, 
 
 ## Support
 
-If this saved you a re-encode: [☕ Ko-fi](https://ko-fi.com/devgodys)
+If this saved you a re-encode: [♥ Support on Ko-fi](https://ko-fi.com/devgodys)
 
 ## License
 
