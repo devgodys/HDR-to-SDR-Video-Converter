@@ -17,8 +17,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QProcess
-from PySide6.QtGui import QFontDatabase, QFont, QTextCursor, QIcon
+from PySide6.QtCore import Qt, QTimer, QProcess, QUrl
+from PySide6.QtGui import QFontDatabase, QFont, QTextCursor, QIcon, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QLineEdit, QPushButton, QComboBox, QCheckBox,
     QSpinBox, QSlider, QProgressBar, QTextEdit, QGroupBox, QVBoxLayout, QHBoxLayout,
@@ -59,6 +59,11 @@ THEMES = {
 
 ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
 CPU_COUNT = os.cpu_count() or 4
+
+# Project links shown as small buttons in the header - edit these to match
+# your actual repo/Ko-fi.
+GITHUB_URL = "https://github.com/godysdev/Open-HDR-to-SDR-convertor"
+KOFI_URL = "https://ko-fi.com/devgodys"
 
 # ffmpeg -progress emits key=value lines in blocks terminated by a
 # "progress=continue"/"progress=end" line.
@@ -108,6 +113,51 @@ TONEMAP_PRO_CPU = {
 
 PRIORITY_LEVELS = ["Efficiency (low)", "Balanced", "Performance (high)"]
 PRIORITY_NICE = {"Efficiency (low)": 10, "Balanced": 0, "Performance (high)": -5}
+
+# ---- bitrate estimation (rough, content-dependent) -------------------
+# This is a ballpark only - CRF/CQ/QP rate control lets the encoder use
+# however many bits a given frame needs, so actual bitrate depends on
+# content complexity (grain, motion, detail) far more than on any of the
+# inputs below. The estimate exists to catch surprises (e.g. "CRF 14 on
+# 4K H.264 is going to be huge"), not to predict an exact number.
+#
+# Anchor: x264 "medium", CRF 23, 1080p, typical live-action content
+# averages roughly 3-4 Mbps - a widely cited x264 rule of thumb. From
+# there:
+#   - every -6 CRF steps roughly doubles the bitrate, and every +6 CRF
+#     roughly halves it - CRF's quantizer scale is logarithmic and a
+#     6-point step is specifically "twice/half the bits" by design.
+#   - bitrate is assumed to scale ~linearly with pixel count (constant
+#     bits-per-pixel).
+#   - H.265/HEVC needs roughly 35-45% fewer bits than H.264 for
+#     comparable quality at the same CRF value.
+#   - Hardware encoders (NVENC/AMF/VideoToolbox) are less bit-efficient
+#     than x264/x265 software encoding at a given quality setting, so
+#     they're nudged upward.
+BITRATE_ANCHOR_1080P_H264_CRF23_KBPS = 3500
+CODEC_EFFICIENCY = {"H.264": 1.0, "H.265": 0.60}
+ENCODER_EFFICIENCY = {"CPU": 1.0, "NVIDIA": 1.35, "AMD": 1.35, "Apple": 1.25}
+
+
+def estimate_bitrate_kbps(encoder_label, quality, width, height):
+    """Rough estimated output bitrate in kbps for the given encoder combo
+    label (an ENCODER_MAP key), CRF/CQ/QP value, and output resolution."""
+    codec = "H.265" if encoder_label.endswith("H.265") else "H.264"
+    if encoder_label.startswith("CPU"):
+        enc_type = "CPU"
+    elif encoder_label.startswith("NVIDIA"):
+        enc_type = "NVIDIA"
+    elif encoder_label.startswith("AMD"):
+        enc_type = "AMD"
+    else:
+        enc_type = "Apple"
+    w = width or 1920
+    h = height or 1080
+    scale = max(1, w * h) / (1920 * 1080)
+    crf_factor = 2 ** ((23 - quality) / 6.0)
+    kbps = (BITRATE_ANCHOR_1080P_H264_CRF23_KBPS * scale * crf_factor
+            * CODEC_EFFICIENCY[codec] * ENCODER_EFFICIENCY[enc_type])
+    return max(150.0, kbps)
 
 ENCODER_MAP = {
     "CPU \u00b7 H.264": "libx264", "CPU \u00b7 H.265": "libx265",
@@ -260,6 +310,8 @@ class MainWindow(QWidget):
 
         self.duration = 0.0
         self.kind = "unknown"
+        self.src_width = None
+        self.src_height = None
         self.has_bt2390 = False
         self.has_st2094 = False
         self.encoders = set()
@@ -318,6 +370,8 @@ class MainWindow(QWidget):
         QPushButton[role="resume-ready"] {{ background: {t['GREEN']}; color: white; border: none; }}
         QPushButton[role="resume-ready"]:hover {{ background: {t['GREEN2']}; }}
         QPushButton[role="theme"] {{ background: {t['CARD']}; border: 1px solid {t['BORDER']}; }}
+        QPushButton[role="kofi"] {{ background: #FF5E5B; color: white; border: none; font-weight: 600; }}
+        QPushButton[role="kofi"]:hover {{ background: #F04642; }}
         QPushButton[role="toggle"] {{
             background: transparent; border: none; color: {t['MUTED']}; font-family: '{self.FONT_SEMI}'; text-align: left;
         }}
@@ -363,6 +417,19 @@ class MainWindow(QWidget):
         htitle.addWidget(subtitle)
         header.addLayout(htitle)
         header.addStretch(1)
+
+        self.github_btn = QPushButton("GitHub")
+        set_role(self.github_btn, "theme")
+        self.github_btn.setToolTip(GITHUB_URL)
+        self.github_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(GITHUB_URL)))
+        header.addWidget(self.github_btn, 0, Qt.AlignmentFlag.AlignTop)
+
+        self.kofi_btn = QPushButton("\u2615 Ko-fi")
+        set_role(self.kofi_btn, "kofi")
+        self.kofi_btn.setToolTip(KOFI_URL)
+        self.kofi_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(KOFI_URL)))
+        header.addWidget(self.kofi_btn, 0, Qt.AlignmentFlag.AlignTop)
+
         self.theme_btn = QPushButton("\U0001F319 Dark mode")
         set_role(self.theme_btn, "theme")
         self.theme_btn.clicked.connect(self.toggle_theme)
@@ -553,6 +620,11 @@ class MainWindow(QWidget):
         set_role(self.cap_label, "muted")
         conv.body.addWidget(self.cap_label)
 
+        self.bitrate_label = QLabel("")
+        self.bitrate_label.setWordWrap(True)
+        set_role(self.bitrate_label, "muted")
+        conv.body.addWidget(self.bitrate_label)
+
         self.brightness_label = QLabel("Brightness boost (-20 to +20, 0 = off)")
         conv.body.addWidget(self.brightness_label)
         self.brightness_spin = QSpinBox()
@@ -644,6 +716,14 @@ class MainWindow(QWidget):
         root.addWidget(self.caps_card)
         self.caps_card.hide()
 
+        # ---- bitrate estimate: keep it live as the relevant settings change --
+        self.quality_spin.valueChanged.connect(self.update_bitrate_estimate)
+        self.encoder_combo.currentTextChanged.connect(self.update_bitrate_estimate)
+        self.backend_combo.currentTextChanged.connect(self.update_bitrate_estimate)
+        self.res_w_edit.textChanged.connect(self.update_bitrate_estimate)
+        self.res_h_edit.textChanged.connect(self.update_bitrate_estimate)
+        self.update_bitrate_estimate()
+
         # Size to actual content rather than a fixed guess - both Activity
         # and Capabilities are collapsed at this point, so this naturally
         # produces a compact window that fits low-resolution screens; it
@@ -695,6 +775,31 @@ class MainWindow(QWidget):
                     self.res_h_edit.setText(h)
                 return
 
+    # ---- bitrate estimate ----------------------------------------------
+    def update_bitrate_estimate(self):
+        v = self.encoder_combo.currentText()
+        if v not in ENCODER_MAP:
+            self.bitrate_label.setText("")
+            return
+        q = self.quality_spin.value()
+        w_txt, h_txt = self.res_w_edit.text().strip(), self.res_h_edit.text().strip()
+        w = int(w_txt) if w_txt.isdigit() else self.src_width
+        h = int(h_txt) if h_txt.isdigit() else self.src_height
+        kbps = estimate_bitrate_kbps(v, q, w, h)
+        mbps = kbps / 1000.0
+        text = f"Approx. output bitrate: ~{mbps:.1f} Mbps"
+        if self.duration:
+            size_gb = (kbps * 1000.0 / 8.0) * self.duration / (1024 ** 3)
+            unit = "GB" if size_gb >= 0.1 else "MB"
+            size_val = size_gb if unit == "GB" else size_gb * 1024
+            text += f" \u2192 ~{size_val:.1f} {unit} for this source"
+        is_hb_hw = (self.backend_combo.currentText().startswith("HandBrake")
+                    and not v.startswith("CPU"))
+        caveat = ("HandBrake's hardware-encoder quality scale isn't directly "
+                  "comparable to CRF, so this is even rougher than usual. " if is_hb_hw else "")
+        text += f". {caveat}Rough guide only \u2014 actual bitrate depends heavily on content complexity."
+        self.bitrate_label.setText(text)
+
     # ---- pro mode --------------------------------------------------
     def toggle_pro_mode(self, checked):
         if checked:
@@ -711,9 +816,11 @@ class MainWindow(QWidget):
             self.brightness_label.setEnabled(False)
             self.brightness_spin.setEnabled(False)
         self.refresh_method_choices()
+        self.update_bitrate_estimate()
 
     # ---- collapse toggles -----------------------------------------
     def toggle_activity(self):
+        self.setUpdatesEnabled(False)
         if self.activity_card.isVisible():
             self.activity_card.hide()
             self.activity_btn.setText("\u25b8 Activity")
@@ -723,6 +830,14 @@ class MainWindow(QWidget):
         self.refit_window()
 
     def toggle_caps(self):
+        # Freeze before check() runs, not just before the resize: check()
+        # updates several labels outside the Capabilities panel itself
+        # (cap_label, backend_note, the status label), and each of those
+        # setText() calls reflows the always-visible Conversion card while
+        # repaints are still enabled - that's what caused the window to
+        # visibly creep upward in a couple of small steps before the
+        # deferred resize even ran.
+        self.setUpdatesEnabled(False)
         if self.caps_card.isVisible():
             self.caps_card.hide()
             self.caps_btn.setText("\u25b8 Capabilities")
@@ -741,12 +856,26 @@ class MainWindow(QWidget):
         without this, collapsing a panel leaves its old blank space behind
         instead of reclaiming it. The singleShot(0, ...) lets the layout
         actually process the visibility change first; calling adjustSize()
-        immediately would still measure the old (pre-change) geometry."""
+        immediately would still measure the old (pre-change) geometry.
+
+        Repaints are already frozen by the caller (toggle_activity/
+        toggle_caps) before any content changed, so nothing paints at an
+        intermediate size/position until _do_refit re-enables updates."""
         QTimer.singleShot(0, self._do_refit)
 
     def _do_refit(self):
+        pos = self.pos()
         self.layout().activate()
         self.resize(self.width(), self.sizeHint().height() + 24)
+        # Growing the window can push its bottom edge off-screen, and some
+        # window managers respond by repositioning the window upward to
+        # keep it visible - resize() itself doesn't move it, but the WM's
+        # own "keep on screen" nudge does, and it doesn't undo itself when
+        # the window shrinks back down. Re-pinning the top-left corner
+        # after every resize stops that nudge from accumulating across
+        # repeated open/close toggles.
+        self.move(pos)
+        self.setUpdatesEnabled(True)
 
     # ---- state / status helper --------------------------------------
     def set_state(self, kind, text):
@@ -947,7 +1076,10 @@ class MainWindow(QWidget):
             self.dst_edit.setText(str(p.with_name(p.stem + "_SDR.mp4")))
             self.kind = "unknown"
             self.duration = 0.0
+            self.src_width = None
+            self.src_height = None
             self.analysis_label.setText("Ready to analyze this source.")
+            self.update_bitrate_estimate()
 
     def browse_output(self):
         cur = self.dst_edit.text()
@@ -983,6 +1115,8 @@ class MainWindow(QWidget):
             s = d["streams"][0]
             fmt_dur = d.get("format", {}).get("duration")
             self.duration = float(fmt_dur or s.get("duration") or 0)
+            self.src_width = s.get("width")
+            self.src_height = s.get("height")
             t = (s.get("color_transfer") or "unknown").lower()
             raw = json.dumps(s).lower()
             if "dovi" in raw or "dolby vision" in raw:
@@ -996,6 +1130,7 @@ class MainWindow(QWidget):
                 note = "Likely SDR/Rec.709. Tone mapping is normally unnecessary."
             dur_note = f"{format_time(self.duration)} ({self.duration:.0f}s)" if self.duration else "unknown (progress/ETA will be limited)"
             self.analysis_label.setText(f"{note} Transfer: {t}; duration: {dur_note}.")
+            self.update_bitrate_estimate()
         except UnicodeDecodeError as e:
             self.analysis_label.setText(f"Analysis failed reading ffprobe's output ({e}). "
                                          "This is usually a corrupted/unusual metadata tag in the file itself, "
@@ -1026,9 +1161,22 @@ class MainWindow(QWidget):
         v = self.encoder_combo.currentText()
         e = ENCODER_MAP[v]
         q = str(self.quality_spin.value())
-        opts = ["-crf", q, "-preset", "medium"] if v.startswith("CPU") else (
-            ["-cq", q] if v.startswith("NVIDIA") else (
-                ["-rc", "cqp", "-qp_i", q, "-qp_p", q] if v.startswith("AMD") else ["-q:v", q]))
+        if v.startswith("CPU"):
+            opts = ["-crf", q, "-preset", "medium"]
+        elif v.startswith("NVIDIA"):
+            # ffmpeg's nvenc "-cq" option treats 0 as "automatic" (i.e. NOT
+            # "best quality") - it silently drops out of constant-quality
+            # mode and falls back to a default bitrate-based rate control,
+            # which is what caused the 50GB -> 6GB / worse-quality surprise.
+            # Remap 0 to 1, the actual best usable -cq value, and force true
+            # constant-quality mode with -rc vbr -b:v 0 so -cq is honored
+            # instead of being capped by a hidden default bitrate.
+            cq = "1" if self.quality_spin.value() == 0 else q
+            opts = ["-rc", "vbr", "-cq", cq, "-b:v", "0"]
+        elif v.startswith("AMD"):
+            opts = ["-rc", "cqp", "-qp_i", q, "-qp_p", q]
+        else:
+            opts = ["-q:v", q]
         cores = self.cores_spin.value()
         if v.startswith("CPU") and 0 < cores < CPU_COUNT:
             opts = opts + ["-threads", str(cores)]
