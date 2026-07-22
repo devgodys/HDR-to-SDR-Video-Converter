@@ -424,7 +424,7 @@ class MainWindow(QWidget):
         self.github_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(GITHUB_URL)))
         header.addWidget(self.github_btn, 0, Qt.AlignmentFlag.AlignTop)
 
-        self.kofi_btn = QPushButton("\u2615 Ko-fi")
+        self.kofi_btn = QPushButton("\u2665 Support on Ko-fi")
         set_role(self.kofi_btn, "kofi")
         self.kofi_btn.setToolTip(KOFI_URL)
         self.kofi_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(KOFI_URL)))
@@ -565,7 +565,10 @@ class MainWindow(QWidget):
         left.addWidget(controls, 1)
 
         # ---- CONVERSION ----
-        conv = Card("CONVERSION")
+        # Exposed as self.conv_card (not just a local var) so a subclass -
+        # e.g. the Pro build's bit-depth selector - can insert into this
+        # card without depending on fragile layout-index guessing.
+        self.conv_card = conv = Card("CONVERSION")
         conv.body.addWidget(QLabel("Backend"))
         self.backend_combo = QComboBox()
         self.backend_combo.addItems(["FFmpeg", "HandBrakeCLI (experimental)"])
