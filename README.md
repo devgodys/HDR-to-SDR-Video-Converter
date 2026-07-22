@@ -7,7 +7,7 @@ A desktop tone-mapping tool for people who care which curve they're using. Stand
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![grandma approved](https://img.shields.io/badge/grandma-approved-ff69b4)
 
-**[Website](https://godysdev.github.io/Open-HDR-to-SDR-convertor/)** · **[Latest release](https://github.com/godysdev/Open-HDR-to-SDR-convertor/releases/latest)**
+**[Website](https://openhdrtosdr.com/)** · **[Latest release](https://github.com/godysdev/Open-HDR-to-SDR-convertor/releases/latest)**
 
 ![Light mode](webassets/app-screenshot-light.png)
 
