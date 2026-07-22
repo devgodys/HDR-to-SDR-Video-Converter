@@ -1,6 +1,6 @@
 # Open HDR to SDR Converter
 
-A desktop tone-mapping tool for people who care which curve they're using. Standard FFmpeg mapping for speed, true BT.2390 on the GPU for accuracy, and an experimental HandBrakeCLI path — all in one window, with the actual command being run always visible.
+A desktop tone-mapping tool for people who care which curve they're using — standard FFmpeg, true BT.2390 on the GPU, or HandBrakeCLI, with the exact command always visible. 10-bit and 12-bit output included, free.
 
 ![platform](https://img.shields.io/badge/platform-Windows-informational)
 ![python](https://img.shields.io/badge/python-3.10%2B-blue)
