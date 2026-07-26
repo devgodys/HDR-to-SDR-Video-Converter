@@ -1,4 +1,4 @@
-# Open HDR to SDR Converter
+# HDR to SDR Movie Converter
 
 A desktop tone-mapping tool for people who care which curve they're using — standard FFmpeg, true BT.2390 on the GPU, or HandBrakeCLI, with the exact command always visible. 10-bit and 12-bit output included, free.
 
