@@ -460,7 +460,7 @@ class Card(QGroupBox):
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Open HDR to SDR Converter")
+        self.setWindowTitle("HDR to SDR Movie Converter")
         self.setAcceptDrops(True)
 
         self.FONT = pick_font(["Segoe UI", "SF Pro Text", "Inter", "Ubuntu", "Helvetica Neue"], "")
@@ -568,6 +568,20 @@ class MainWindow(QWidget):
             background: transparent; border: none; color: {t['MUTED']}; font-family: '{self.FONT_SEMI}'; text-align: left;
         }}
         QPushButton[role="toggle"]:hover {{ color: {t['INDIGO']}; }}
+        QPushButton[role="panel-toggle"] {{
+            background: {t['CARD2']}; border: 1px solid {t['BORDER']}; border-radius: 6px;
+            padding: 6px 14px; color: {t['MUTED']}; font-weight: 600;
+        }}
+        QPushButton[role="panel-toggle"]:hover {{
+            background: {t['CARD']}; color: {t['TXT']}; border-color: {t['INDIGO']};
+        }}
+        QPushButton[role="panel-toggle"]:checked {{
+            background: {t['INDIGO']}; color: white; border-color: {t['INDIGO']};
+        }}
+        QPushButton[role="panel-toggle"]:checked:hover {{ background: {t['INDIGO2']}; }}
+        QFrame[role="toolbar"] {{
+            background: {t['BG']}; border: 1px solid {t['BORDER']}; border-radius: 6px;
+        }}
         QPushButton[role="preview-view"] {{
             background: transparent; color: {t['INDIGO']}; border: 1.5px solid {t['INDIGO']};
             border-radius: 6px; font-weight: 600; padding: 5px 16px;
@@ -626,17 +640,11 @@ class MainWindow(QWidget):
         # header
         header = QHBoxLayout()
         htitle = QVBoxLayout()
-        title = QLabel("Open HDR to SDR Converter")
+        title = QLabel("HDR to SDR Movie Converter")
         set_role(title, "title")
         htitle.addWidget(title)
         header.addLayout(htitle)
         header.addStretch(1)
-
-        self.github_btn = QPushButton("GitHub")
-        set_role(self.github_btn, "theme")
-        self.github_btn.setToolTip(GITHUB_URL)
-        self.github_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(GITHUB_URL)))
-        header.addWidget(self.github_btn, 0, Qt.AlignmentFlag.AlignTop)
 
         self.kofi_btn = QPushButton("\u2665 Support on Ko-fi")
         set_role(self.kofi_btn, "kofi")
@@ -926,16 +934,54 @@ class MainWindow(QWidget):
 
         right.addWidget(conv, 1)
 
-        # ---- Activity / Capabilities: permanent bottom row + a panel
-        # docked below the splitter, opening upward from that row ----
-        # Third layout for this feature. The side-rail version (narrow
-        # column next to CONVERSION) worked mechanically - no resize jump -
-        # but looked cramped and wasn't where a "toggle a panel" control is
-        # expected to live. Back to a persistent bottom row (like the very
-        # first version), except the panel it opens is no longer a
-        # sideways-growing splitter pane - it's a plain widget docked below
-        # the splitter and above this row, so opening it takes height from
-        # the splitter (which shrinks) rather than from window width.
+        # ---- SYSTEM ----
+        # Own card now (was previously a toolbar strip tacked onto the
+        # bottom of CONVERSION) so it reads as its own section, same as
+        # FILES/SOURCE ANALYSIS/PROGRESS/CONTROLS, instead of looking like
+        # part of the conversion settings above it.
+        self.activity_card = activity_card = Card("SYSTEM")
+        panel_row = QHBoxLayout()
+        panel_row.setContentsMargins(0, 0, 0, 0)
+        panel_row.setSpacing(8)
+        self.activity_tab_btn = QPushButton("Activity")
+        self.activity_tab_btn.setCheckable(True)
+        set_role(self.activity_tab_btn, "panel-toggle")
+        self.activity_tab_btn.clicked.connect(self.toggle_activity)
+        self.caps_tab_btn = QPushButton("System")
+        self.caps_tab_btn.setCheckable(True)
+        set_role(self.caps_tab_btn, "panel-toggle")
+        self.caps_tab_btn.clicked.connect(self.toggle_caps)
+        panel_row.addStretch(1)
+        panel_row.addWidget(self.activity_tab_btn)
+        panel_row.addStretch(1)
+        panel_row.addWidget(self.caps_tab_btn)
+        panel_row.addStretch(1)
+        if sys.platform.startswith("win"):
+            # A shortcut straight to the winget install this app can already
+            # do - previously that button only existed inside the System
+            # panel's Capabilities page, a click and a scroll away. This
+            # calls the exact same start_dependency_setup() (which already
+            # handles "nothing to install", missing winget, and switching
+            # to Activity to show progress on its own), just reachable
+            # without opening a panel first.
+            self.quick_install_btn = QPushButton("Quick install")
+            set_role(self.quick_install_btn, "panel-toggle")
+            self.quick_install_btn.setToolTip("Install FFmpeg/HandBrakeCLI automatically via winget")
+            self.quick_install_btn.clicked.connect(self.start_dependency_setup)
+            panel_row.addWidget(self.quick_install_btn)
+            panel_row.addStretch(1)
+        activity_card.body.addLayout(panel_row)
+        right.addWidget(activity_card)
+
+        # ---- Activity / Capabilities: one panel docked below the
+        # splitter, opened from the two toggle buttons above ----
+        # Third layout for this feature. The buttons themselves have moved
+        # a couple of times now (side rail, a row inside CONVERSION, now
+        # their own SYSTEM card) - but the panel they open stays
+        # exactly where the previous version put it: a plain widget docked
+        # below the splitter, which shrinks to give it height rather than
+        # the window growing sideways or the buttons needing to live next
+        # to it.
         self.side_panel = QWidget()
         self.side_panel.setMinimumHeight(160)
         self.side_panel.setMaximumHeight(260)
@@ -970,6 +1016,7 @@ class MainWindow(QWidget):
         if sys.platform.startswith("win"):
             setup_row = QHBoxLayout()
             self.setup_btn = QPushButton("Install missing (winget)")
+            set_role(self.setup_btn, "panel-toggle")
             self.setup_btn.clicked.connect(self.start_dependency_setup)
             setup_row.addWidget(self.setup_btn)
             setup_row.addStretch(1)
@@ -992,18 +1039,6 @@ class MainWindow(QWidget):
         caps_page.setWidgetResizable(True)
         caps_page.setFrameShape(QFrame.Shape.NoFrame)
         self.side_stack.addWidget(caps_page)  # index 1
-
-        bottom_row = QHBoxLayout()
-        self.activity_tab_btn = QPushButton("\u25b8 Activity")
-        set_role(self.activity_tab_btn, "toggle")
-        self.activity_tab_btn.clicked.connect(self.toggle_activity)
-        self.caps_tab_btn = QPushButton("\u25b8 Capabilities")
-        set_role(self.caps_tab_btn, "toggle")
-        self.caps_tab_btn.clicked.connect(self.toggle_caps)
-        bottom_row.addWidget(self.activity_tab_btn)
-        bottom_row.addWidget(self.caps_tab_btn)
-        bottom_row.addStretch(1)
-        root.addLayout(bottom_row)
 
         # ---- bitrate estimate: keep it live as the relevant settings change --
         self.quality_spin.valueChanged.connect(self.update_bitrate_estimate)
@@ -1150,8 +1185,8 @@ class MainWindow(QWidget):
             self.side_tab = tab
             self.side_stack.setCurrentIndex(0 if tab == "activity" else 1)
             self.side_panel.show()
-        self.activity_tab_btn.setText("\u25be Activity" if self.side_tab == "activity" else "\u25b8 Activity")
-        self.caps_tab_btn.setText("\u25be Capabilities" if self.side_tab == "caps" else "\u25b8 Capabilities")
+        self.activity_tab_btn.setChecked(self.side_tab == "activity")
+        self.caps_tab_btn.setChecked(self.side_tab == "caps")
         # layout().activate() alone grows a top-level window when its new
         # minimum height is *larger* than the current size - that's what
         # made opening the panel work with no explicit resize call at all.
@@ -1375,6 +1410,7 @@ class MainWindow(QWidget):
             return
         self._setup_queue = todo
         self.setup_btn.setEnabled(False)
+        self.quick_install_btn.setEnabled(False)
         if self.side_tab != "activity":
             self.toggle_activity()
         self.write(f"\n[setup] Installing {len(todo)} package(s) via winget \u2014 a Windows permission "
@@ -1388,6 +1424,7 @@ class MainWindow(QWidget):
             self.handbrake_tool = exe("HandBrakeCLI")
             self.check()
             self.setup_btn.setEnabled(True)
+            self.quick_install_btn.setEnabled(True)
             QMessageBox.information(self, "Setup complete", "Dependency installation finished \u2014 see Activity log for details.")
             return
         pkg_id, name = self._setup_queue.pop(0)
@@ -1417,6 +1454,7 @@ class MainWindow(QWidget):
         self.write(f"[setup] Failed to launch winget for {name}.\n")
         self._setup_proc = None
         self.setup_btn.setEnabled(True)
+        self.quick_install_btn.setEnabled(True)
 
     # ---- file pickers ---------------------------------------------
     def browse_source(self):
