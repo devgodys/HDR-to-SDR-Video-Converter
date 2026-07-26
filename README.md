@@ -1,4 +1,4 @@
-# HDR to SDR Movie Converter
+# Open HDR to SDR Converter
 
 A desktop tone-mapping tool for people who care which curve they're using — standard FFmpeg, true BT.2390 on the GPU, or HandBrakeCLI, with the exact command always visible. 10-bit and 12-bit output included, free.
 
@@ -34,8 +34,8 @@ Three genuinely different pipelines, not one "auto" button:
 - **True BT.2390 tone mapping** via libplacebo/Vulkan — not a CPU approximation
 - **10-bit & 12-bit output** — free, no license, no separate build. 10-bit works with any H.265 encoder (CPU or hardware); 12-bit is CPU libx265 only, since no common hardware encoder does 12-bit HEVC
 - **Full curve library** — Hable, Reinhard, Mobius, BT.2446A, ST2094-10/40, Linear, Gamma, Clip, None, each with a hover tooltip explaining its actual tradeoffs
-- **Source-aware curve recommendation** — Analyze reads the file's transfer characteristics and HDR10+/Dolby Vision metadata and suggests a curve for that specific source, rather than assuming one setting fits everything
-- **Live Preview** — a real decoded-and-tone-mapped frame from your source, refreshed as you change settings, with a shadow/highlight clipping check so you can catch a curve crushing detail before committing to a full encode
+- **Analyzes automatically** — pick a source and it's read (transfer characteristics, HDR10+/Dolby Vision metadata) and a curve recommended right away, no separate Analyze step; the SDR output path is filled in for you too
+- **Live Preview** — a real decoded-and-tone-mapped frame from your source, refreshed as you change settings, with a shadow/highlight clipping check so you can catch a curve crushing detail before committing to a full encode. View it full size or save the frame straight to disk
 - **Live bitrate estimate** — updates automatically as you change quality, resolution, or encoder, so a surprising CRF/resolution combo shows up before you hit Start, not after
 - **Hardware encoding** — CPU (x264/x265), NVIDIA NVENC, AMD AMF, Apple VideoToolbox
 - **Resolution presets** — Source, 4K, 1440p, 1080p, 720p, 480p, or custom; scaling is height-driven with width computed to match, so non-16:9 sources aren't stretched
@@ -43,8 +43,8 @@ Three genuinely different pipelines, not one "auto" button:
 - **Drag and drop** — drop a video file anywhere on the window to set it as the source
 - **Live run controls** — pause/resume, live CPU-core affinity, and process priority, all adjustable mid-conversion
 - **Live resource monitoring** — CPU and GPU usage shown while converting
-- **Activity & Capabilities panels** — a live log of the actual FFmpeg/HandBrake output, and a report of what's detected on your system (FFmpeg, Vulkan, HandBrakeCLI) before you convert
-- **One-click Windows setup** — missing FFmpeg/HandBrakeCLI installed via `winget` from inside the app
+- **Activity & System panels** — a live log of the actual FFmpeg/HandBrake output, and a report of what's detected on your system (FFmpeg, Vulkan, HandBrakeCLI) before you convert
+- **One-click Windows setup** — missing FFmpeg/HandBrakeCLI installed via `winget` from inside the app, with a "Quick install" shortcut right in the header so you don't need to open a panel first
 - **Transparent by design** — the exact command line is always visible, never hidden behind "auto"
 - Light and dark themes
 
@@ -59,7 +59,7 @@ Three genuinely different pipelines, not one "auto" button:
 | HandBrakeCLI *(optional)* | The experimental HandBrake backend |
 | psutil *(optional)* | Live pause/resume, CPU-core control, resource stats |
 
-On Windows, missing FFmpeg/HandBrakeCLI can be installed automatically from inside the app via `winget` — see the Capabilities panel.
+On Windows, missing FFmpeg/HandBrakeCLI can be installed automatically from inside the app via `winget` — see the System panel, or the "Quick install" shortcut in the header.
 
 ## Install & run
 
@@ -78,10 +78,10 @@ Or grab a prebuilt Windows `.exe` from the [latest release](https://github.com/g
 
 ## Basic workflow
 
-1. Pick a **Source** HDR file and an **SDR output** path, then click **Analyze**. Analysis reports the transfer function, bit depth, and duration, and suggests a curve based on what it finds (plain HDR, HDR10+ metadata, Dolby Vision, or footage that's already SDR).
+1. Pick a **Source** HDR file — analysis runs automatically (transfer function, bit depth, duration, and a curve suggested based on what it finds: plain HDR, HDR10+ metadata, Dolby Vision, or footage that's already SDR), and the **SDR output** path is filled in for you. Drag-and-drop works too.
 2. Choose a **backend** and **curve** — BT.2390 on GPU is the sane default; fall back to Standard FFmpeg without a Vulkan-capable GPU. Hover a curve for a plain-language rundown of what it trades off.
 3. Set **resolution**, **encoder**, and **bit depth**. Leave resolution on "Source" to keep the original frame size and aspect ratio.
-4. Adjust **quality**, or enable **Pro mode** for the full CRF/CQ range, extra curves, and a brightness trim. Check the **Live Preview** panel — it shows an actual tone-mapped frame and flags shadow/highlight clipping — and the live bitrate estimate before committing.
+4. Adjust **quality**, or enable **Pro mode** for the full CRF/CQ range, extra curves, and a brightness trim. Check the **Live Preview** panel — it shows an actual tone-mapped frame and flags shadow/highlight clipping, and you can view it full size or save the frame to disk — plus the live bitrate estimate, before committing.
 5. Click **Start** — progress, speed, ETA, and live FFmpeg/HandBrake output are all shown as it runs. Pause/resume, CPU-core limits, and process priority can all be adjusted mid-conversion.
 
 ## Building a standalone executable
