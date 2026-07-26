@@ -25,7 +25,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QProcess, QUrl
+from PySide6.QtCore import Qt, QTimer, QProcess, QUrl, QSize
 from PySide6.QtGui import QFontDatabase, QFont, QTextCursor, QIcon, QDesktopServices, QPixmap, QImage
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QLineEdit, QPushButton, QComboBox, QCheckBox,
@@ -417,6 +417,40 @@ def find_icon():
         if p.is_file():
             return str(p)
     return None
+
+
+# Sizes Windows actually requests for a top-level window/taskbar icon across
+# its scale-factor table (100%-400%): 16/20/24/30/32/36/40/48/60/64/72/80/96,
+# plus 128/256 for Alt+Tab and jump-list thumbnails on very high DPI.
+ICON_SIZES = (16, 20, 24, 30, 32, 36, 40, 48, 60, 64, 72, 80, 96, 128, 256)
+
+
+def load_app_icon():
+    """Build the runtime QIcon (title bar / taskbar button / Alt+Tab) from
+    the icons/icon-<size>.png set, registering every size explicitly via
+    addFile(..., QSize(...)).
+
+    QIcon(path) on a single file - even a multi-resolution .ico - only ever
+    reads that file's first embedded frame; it does NOT auto-select the
+    matching size the way Windows' own shell icon extraction does. Loading
+    every PNG explicitly is the documented way to get a crisp, exact match
+    at each size instead of Qt scaling one fixed pixmap up or down.
+
+    icon.ico (via find_icon()) is kept as the fallback for a plain
+    Python-from-source run where the icons/ folder hasn't been unpacked
+    next to the script, and is still what --icon embeds as the .exe's own
+    file icon at compile time - Explorer/the shell extracts the matching
+    size from that file natively, so it doesn't need this treatment."""
+    icon = QIcon()
+    icons_dir = ROOT / "icons"
+    for size in ICON_SIZES:
+        p = icons_dir / f"icon-{size}.png"
+        if p.is_file():
+            icon.addFile(str(p), QSize(size, size))
+    if not icon.isNull():
+        return icon
+    p = find_icon()
+    return QIcon(p) if p else QIcon()
 
 
 # ---- small widget helpers -----------------------------------------------
@@ -2269,12 +2303,12 @@ def install_excepthook(win):
 
 def main():
     app = QApplication(sys.argv)
-    icon_path = find_icon()
-    if icon_path:
-        app.setWindowIcon(QIcon(icon_path))
+    icon = load_app_icon()
+    if not icon.isNull():
+        app.setWindowIcon(icon)
     win = MainWindow()
-    if icon_path:
-        win.setWindowIcon(QIcon(icon_path))
+    if not icon.isNull():
+        win.setWindowIcon(icon)
     install_excepthook(win)
     win.show()
     sys.exit(app.exec())
