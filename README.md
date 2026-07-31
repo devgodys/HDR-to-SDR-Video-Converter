@@ -106,24 +106,38 @@ Or grab a prebuilt Windows `.exe` from the [latest release](https://github.com/g
 
 ## Building a standalone executable
 
-```bash
-pip install pyinstaller
-pyinstaller --windowed --onefile --icon=icon.ico \
-  --add-data "icon.ico:." \
-  --add-data "icons:icons" \
-  hdr_to_sdr_gui_qt.py
-```
-
-Drop `icon.ico` *and* an `icons/` folder (containing `icon-<size>.png` files,
+Windows only (this builds a `.exe`, so it has to run on Windows). Drop
+`icon.ico` *and* an `icons/` folder (containing `icon-<size>.png` files,
 e.g. `icon-16.png`, `icon-32.png`, `icon-256.png`) next to the script
-beforehand — both are picked up automatically, in-app and as the exe's file
-icon. `--icon=icon.ico` alone only sets the compiled exe's *own* file icon;
-the `--add-data` flags are what let the running app find `icon.ico`/`icons/`
-at runtime for its title bar and taskbar icon. On Windows, use `;` instead
-of `:` as the `--add-data` separator:
+beforehand — both get bundled and are picked up automatically, in-app and
+as the exe's file icon.
 
 ```bat
-pyinstaller --windowed --onefile --icon=icon.ico ^
+pip install pyinstaller
+```
+
+Then run this as **one single line** in `cmd.exe` or PowerShell
+(copy-pasting a multi-line `\`-continued Unix-style command into `cmd.exe`
+will silently break it into separate, broken commands — `cmd` doesn't
+understand `\` as a line continuation):
+
+```bat
+python -m PyInstaller --noconfirm --windowed --onefile --name "HDR-to-SDR-Converter" --icon icon.ico --add-data "icon.ico;." --add-data "icons;icons" hdr_to_sdr_gui_qt.py
+```
+
+`python -m PyInstaller` (rather than bare `pyinstaller`) is deliberate: pip
+often installs the `pyinstaller` console script into a `Scripts\` folder
+that isn't on your `PATH`, which gives a `'pyinstaller' is not recognized`
+error even though the package installed fine. `python -m PyInstaller` runs
+it as a module instead, so it works as long as `python` itself is on `PATH`
+— no separate PATH fix needed.
+
+If you'd rather split it across multiple lines for readability, use `^` (not
+`\`) as the line-continuation character in `cmd.exe`:
+
+```bat
+python -m PyInstaller --noconfirm --windowed --onefile --name "HDR-to-SDR-Converter" ^
+  --icon icon.ico ^
   --add-data "icon.ico;." ^
   --add-data "icons;icons" ^
   hdr_to_sdr_gui_qt.py
