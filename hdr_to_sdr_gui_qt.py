@@ -25,7 +25,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QProcess, QUrl, QSize
+from PySide6.QtCore import Qt, QTimer, QProcess, QUrl, QSize, QEvent
 from PySide6.QtGui import QFontDatabase, QFont, QTextCursor, QIcon, QDesktopServices, QPixmap, QImage
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QLineEdit, QPushButton, QComboBox, QCheckBox,
@@ -255,6 +255,27 @@ FFMPEG_BIT_DEPTH = {
         "AMD AMF \u00b7 H.265", "Apple VideoToolbox \u00b7 H.265",
     }),
     "12-bit": ("yuv420p12le", {"CPU \u00b7 H.265"}),
+}
+
+# ffprobe color_transfer/color_primaries/color_space(matrix) values -> short
+# human-readable labels for the SOURCE ANALYSIS card. Only covers what
+# actually turns up in real-world files; anything else falls back to the
+# raw ffprobe string as-is, so an unrecognised value still shows *something*
+# instead of a blank or a KeyError.
+TRANSFER_NAMES = {
+    "smpte2084": "PQ (SMPTE ST 2084)", "pq": "PQ (SMPTE ST 2084)",
+    "arib-std-b67": "HLG (ARIB STD-B67)", "hlg": "HLG (ARIB STD-B67)",
+    "bt709": "BT.709", "bt470bg": "BT.601 (PAL)", "smpte170m": "BT.601 (NTSC)",
+    "linear": "Linear", "unknown": "unknown",
+}
+PRIMARIES_NAMES = {
+    "bt2020": "BT.2020", "bt709": "BT.709",
+    "smpte432": "Display P3", "smpte431": "DCI-P3",
+    "bt470bg": "BT.601 (PAL)", "smpte170m": "BT.601 (NTSC)", "unknown": "unknown",
+}
+MATRIX_NAMES = {
+    "bt2020nc": "BT.2020 non-constant luminance", "bt2020c": "BT.2020 constant luminance",
+    "bt709": "BT.709", "smpte170m": "BT.601", "bt470bg": "BT.601 (PAL)", "unknown": "unknown",
 }
 
 # ---- HandBrakeCLI side: encoder label -> {bit depth label: -e id}.
@@ -521,6 +542,9 @@ class MainWindow(QWidget):
         self._frame_preview_proc = None
         self._frame_preview_gen = 0
         self._current_preview_pixmap = None
+        self._test_clip_proc = None
+        self._test_clip_out = None
+        self._last_analysis_raw = None
         self.side_tab = None
         self.stopping = False
         self.paused = False
@@ -629,6 +653,22 @@ class MainWindow(QWidget):
         QPushButton[role="preview-view"]:disabled, QPushButton[role="preview-save"]:disabled {{
             background: transparent; color: {t['MUTED']}; border-color: {t['BORDER']};
         }}
+        QPushButton[role="icon-btn"] {{
+            background: transparent; color: {t['MUTED']}; border: 1.5px solid {t['BORDER']};
+            border-radius: 8px; font-size: 13pt; padding: 0px;
+        }}
+        QPushButton[role="icon-btn"]:hover {{ background: {t['CARD2']}; color: {t['INDIGO']}; border-color: {t['INDIGO']}; }}
+        QPushButton[role="icon-btn"]:disabled {{ color: {t['BORDER']}; border-color: {t['BORDER']}; background: transparent; }}
+        QPushButton[role="icon-btn-ready"] {{
+            background: {t['GREEN']}; color: white; border: 1.5px solid {t['GREEN']};
+            border-radius: 8px; font-size: 13pt; padding: 0px; font-weight: 600;
+        }}
+        QPushButton[role="icon-btn-ready"]:hover {{ background: {t['GREEN2']}; border-color: {t['GREEN2']}; }}
+        QPushButton[role="icon-btn-busy"] {{
+            background: {t['AMBER']}; color: white; border: 1.5px solid {t['AMBER']};
+            border-radius: 8px; font-size: 13pt; padding: 0px; font-weight: 600;
+        }}
+        QPushButton[role="icon-btn-busy"]:hover {{ background: {t['AMBER2']}; border-color: {t['AMBER2']}; }}
         QCheckBox {{ background: transparent; }}
         QSlider::groove:horizontal {{ height: 4px; background: {t['FIELD']}; border: 1px solid {t['BORDER']}; border-radius: 2px; }}
         QSlider::handle:horizontal {{ width: 14px; margin: -6px 0; background: {t['INDIGO']}; border-radius: 7px; }}
@@ -729,16 +769,46 @@ class MainWindow(QWidget):
         analysis = Card("SOURCE ANALYSIS")
         self.analysis_label = QLabel("Select a video to analyze it automatically.")
         self.analysis_label.setWordWrap(True)
-        # The placeholder above is one line, but analyze() replaces it with a
-        # real 2-3 line result (transfer/bit depth/duration/recommendation) -
-        # reserving that height now means picking a source file doesn't grow
-        # the card (and the window) the way the short placeholder alone
-        # would. Same fix as the Tone mapping combo above, applied to a
-        # label instead of a combo box.
-        self.analysis_label.setMinimumHeight(66)
+        # Left+Top, not the QLabel default of Left+VCenter - vertical
+        # centering was making any gap between the actual text height and a
+        # reserved minimum height look like blank padding above *and* below.
+        self.analysis_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        # Deliberately no fixed setMinimumHeight() here (there used to be
+        # one, guessed in pixels): actual line height depends on the
+        # system's font/DPI, and a bigger-than-needed guess is exactly what
+        # kept leaving a large dead area under the text - guessing again
+        # would just as likely reproduce it on a different setup. The card
+        # doing a small one-time resize once analyze() fills this in is a
+        # smaller cost than a persistent block of empty space for the rest
+        # of the session.
         set_role(self.analysis_label, "muted")
         analysis.body.addWidget(self.analysis_label)
+
+        # One-click "just do it" versions of the three lines above: apply
+        # that tier's tone-mapping curve/encoder/quality settings without
+        # the person having to translate the recommendation into dropdown
+        # picks themselves. Disabled until a source has actually been
+        # analyzed (self.kind starts "unknown").
+        preset_row = QHBoxLayout()
+        self.preset_optimal_btn = QPushButton("Optimal")
+        self.preset_best_btn = QPushButton("Best quality")
+        self.preset_fast_btn = QPushButton("Fast")
+        for b, fn, tip in (
+            (self.preset_optimal_btn, self._apply_optimal_preset,
+             "Apply the Optimal tone-mapping curve for this source (matches the app defaults in most cases)."),
+            (self.preset_best_btn, self._apply_best_quality_preset,
+             "Apply the Best quality settings: CPU \u00b7 H.265, Pro mode, low CRF, best available curve. Slower."),
+            (self.preset_fast_btn, self._apply_fast_preset,
+             "Apply the Fast settings: hardware encoder if this machine has one (else CPU \u00b7 H.264), simple curve."),
+        ):
+            set_role(b, "panel-toggle")
+            b.setEnabled(False)
+            b.setToolTip(tip)
+            b.clicked.connect(fn)
+            preset_row.addWidget(b)
+        analysis.body.addLayout(preset_row)
         left.addWidget(analysis)
+
 
         # ---- LIVE PREVIEW ----
         # Two sources feed the same label at different times: an instant
@@ -753,25 +823,74 @@ class MainWindow(QWidget):
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_label.setMinimumHeight(180)
         set_role(self.preview_label, "muted")
+        self.preview_label.installEventFilter(self)
         preview.body.addWidget(self.preview_label)
         self.preview_meta_label = QLabel("")
         self.preview_meta_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         set_role(self.preview_meta_label, "muted")
         preview.body.addWidget(self.preview_meta_label)
-        preview_btns = QHBoxLayout()
-        self.preview_expand_btn = QPushButton("\u26f6  View full size")
-        set_role(self.preview_expand_btn, "preview-view")
+
+        # All preview-related actions live in one row of same-size icon
+        # buttons rather than two rows of differently sized text buttons -
+        # each one's tooltip carries the full description (same pattern as
+        # the tone-mapping dropdown), so nothing needs a permanent text
+        # label competing for space. Readiness of the test clip is shown by
+        # the "open" button turning green rather than by a status sentence.
+        btn_row = QHBoxLayout()
+        self.preview_expand_btn = QPushButton("\u26f6")
+        set_role(self.preview_expand_btn, "icon-btn")
         self.preview_expand_btn.setEnabled(False)
+        self.preview_expand_btn.setToolTip("View full size \u2014 open the current preview frame in a larger window.")
         self.preview_expand_btn.clicked.connect(self.show_preview_fullscreen)
-        self.preview_save_btn = QPushButton("\u2913  Save frame\u2026")
-        set_role(self.preview_save_btn, "preview-save")
+
+        self.preview_save_btn = QPushButton("\u2913")
+        set_role(self.preview_save_btn, "icon-btn")
         self.preview_save_btn.setEnabled(False)
+        self.preview_save_btn.setToolTip("Save frame \u2014 save the current preview frame to disk as an image.")
         self.preview_save_btn.clicked.connect(self.save_preview_frame)
-        preview_btns.addStretch(1)
-        preview_btns.addWidget(self.preview_expand_btn)
-        preview_btns.addWidget(self.preview_save_btn)
-        preview_btns.addStretch(1)
-        preview.body.addLayout(preview_btns)
+
+        # The instant still-frame preview above is always rendered through
+        # ffmpeg regardless of the chosen backend. It can't show motion,
+        # real bitrate/quality at the actual encoder settings, or (for the
+        # HandBrake backend) exactly what HandBrakeCLI will produce.
+        # Rendering a full live preview during the real encode would mean
+        # running ffmpeg in parallel with HandBrakeCLI just for that
+        # purpose, which is a lot of moving parts for a preview - so
+        # instead, offer a cheap one-off: encode a short real clip with
+        # today's settings through the actual backend that will be used,
+        # and let the person play it back with their own player.
+        self.test_clip_btn = QPushButton("\u25b6")
+        set_role(self.test_clip_btn, "icon-btn")
+        self.test_clip_btn.setToolTip(
+            "Render 5s test clip \u2014 encode a short real clip from the middle of the "
+            "source with the current settings, through the backend that will be used "
+            "for the full conversion, so you can check quality and motion first.")
+        self.test_clip_btn.clicked.connect(self._run_test_clip)
+
+        self.test_clip_open_btn = QPushButton("\u2197")
+        set_role(self.test_clip_open_btn, "icon-btn")
+        self.test_clip_open_btn.setEnabled(False)
+        self.test_clip_open_btn.setToolTip(
+            "Open test clip \u2014 no test clip rendered yet. Turns green once one is ready to play.")
+        self.test_clip_open_btn.clicked.connect(self._open_test_clip)
+
+        btn_row.addStretch(1)
+        for b in (self.preview_expand_btn, self.preview_save_btn, self.test_clip_btn, self.test_clip_open_btn):
+            b.setFixedSize(34, 34)
+            btn_row.addWidget(b)
+        btn_row.addStretch(1)
+        preview.body.addLayout(btn_row)
+
+        # Short-lived only: rendering progress and failures. Cleared again
+        # once idle or on success, since success is shown by the "open"
+        # button's colour instead.
+        self.test_clip_status = QLabel("")
+        self.test_clip_status.setWordWrap(True)
+        self.test_clip_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        set_role(self.test_clip_status, "muted")
+        self.test_clip_status.setVisible(False)
+        preview.body.addWidget(self.test_clip_status)
+
         left.addWidget(preview)
 
         # ---- PROGRESS ----
@@ -908,10 +1027,10 @@ class MainWindow(QWidget):
 
         self.hwaccel_chk = QCheckBox("Hardware-accelerated decode")
         conv.body.addWidget(self.hwaccel_chk)
-        hwaccel_note = QLabel("CUDA / DXVA2 / VideoToolbox \u2014 FFmpeg only.")
-        hwaccel_note.setWordWrap(True)
-        set_role(hwaccel_note, "muted")
-        conv.body.addWidget(hwaccel_note)
+        self.hwaccel_note = QLabel("")
+        self.hwaccel_note.setWordWrap(True)
+        set_role(self.hwaccel_note, "muted")
+        conv.body.addWidget(self.hwaccel_note)
 
         conv.body.addWidget(QLabel("Quality (CRF/CQ)"))
         qf = QHBoxLayout()
@@ -952,6 +1071,18 @@ class MainWindow(QWidget):
         bf.addWidget(self.brightness_spin)
         bf.addWidget(self.brightness_slider, 1)
         conv.body.addLayout(bf)
+
+        self.brightness_backend_note = QLabel("")
+        self.brightness_backend_note.setWordWrap(True)
+        set_role(self.brightness_backend_note, "muted")
+        conv.body.addWidget(self.brightness_backend_note)
+
+        self.backend_combo.currentTextChanged.connect(lambda _t: self._update_brightness_availability())
+        self._update_brightness_availability()
+
+        self.backend_combo.currentTextChanged.connect(lambda _t: self._update_hwaccel_note())
+        self.encoder_combo.currentTextChanged.connect(lambda _t: self._update_hwaccel_note())
+        self._update_hwaccel_note()
 
         conv.body.addWidget(QLabel("Output resolution"))
         self.res_combo = QComboBox()
@@ -1175,21 +1306,52 @@ class MainWindow(QWidget):
         if checked:
             self.quality_spin.setRange(0, 51)
             self.quality_slider.setRange(0, 51)
-            self.brightness_label.setEnabled(True)
-            self.brightness_spin.setEnabled(True)
-            self.brightness_slider.setEnabled(True)
         else:
             self.quality_spin.setRange(14, 28)
             self.quality_slider.setRange(14, 28)
             if not (14 <= self.quality_spin.value() <= 28):
                 self.quality_spin.setValue(18)
-            self.brightness_spin.setValue(0)
-            self.brightness_label.setEnabled(False)
-            self.brightness_spin.setEnabled(False)
-            self.brightness_slider.setEnabled(False)
+        self._update_brightness_availability()
         self.refresh_method_choices()
         self.update_bitrate_estimate()
         self._schedule_frame_preview()
+
+    def _update_hwaccel_note(self):
+        # command_ffmpeg() always adds "-hwaccel auto" when checked, regardless
+        # of encoder. command_handbrake() only adds "--enable-hw-decoding nvdec"
+        # when checked *and* the selected encoder is NVIDIA NVENC - it's a
+        # no-op with every other HandBrake encoder. The note used to just say
+        # "FFmpeg only", which was wrong (it does affect the HandBrake/NVENC
+        # command too) - reflect the real, per-backend behaviour instead.
+        using_hb = self.backend_combo.currentText().startswith("HandBrake")
+        label = self.encoder_combo.currentText()
+        if using_hb:
+            if label.startswith("NVIDIA NVENC"):
+                text = "HandBrakeCLI: enables NVDEC decoding for this NVENC encoder."
+            else:
+                text = "HandBrakeCLI: only has an effect with an NVIDIA NVENC encoder \u2014 no effect with the current encoder."
+        else:
+            text = "FFmpeg: requests CUDA / DXVA2 / VideoToolbox decoding automatically."
+        self.hwaccel_note.setText(text)
+
+    def _update_brightness_availability(self):
+        # HandBrakeCLI has no equivalent of ffmpeg's eq=brightness filter, so
+        # the setting is silently ignored by command_handbrake(). Rather than
+        # let the live preview (always rendered via ffmpeg) show an effect
+        # that never makes it into the actual HandBrake output, disable the
+        # control for that backend and explain why.
+        using_hb = self.backend_combo.currentText().startswith("HandBrake")
+        enabled = self.pro_mode_chk.isChecked() and not using_hb
+        self.brightness_label.setEnabled(enabled)
+        self.brightness_spin.setEnabled(enabled)
+        self.brightness_slider.setEnabled(enabled)
+        if using_hb:
+            self.brightness_spin.setValue(0)
+            self.brightness_backend_note.setText(
+                "Not available on the HandBrake backend (no equivalent filter) "
+                "\u2014 switch to FFmpeg to use it.")
+        else:
+            self.brightness_backend_note.setText("")
 
     # ---- collapse toggles -----------------------------------------
     def toggle_activity(self):
@@ -1538,13 +1700,24 @@ class MainWindow(QWidget):
             d = json.loads(subprocess.check_output(
                 [p, "-v", "error", "-select_streams", "v:0", "-show_streams", "-show_format", "-of", "json",
                  self.src_edit.text()],
-                text=True, encoding="utf-8", errors="replace", **no_window_kwargs()))
+                # errors="strict" (not "replace") is deliberate here: this is the one call site
+                # with a dedicated except UnicodeDecodeError below that gives a specific,
+                # friendlier message for corrupted/unusual metadata tags. "replace" would silently
+                # swallow the decode error, making that except branch unreachable dead code.
+                text=True, encoding="utf-8", errors="strict", **no_window_kwargs()))
             s = d["streams"][0]
             fmt_dur = d.get("format", {}).get("duration")
             self.duration = float(fmt_dur or s.get("duration") or 0)
             self.src_width = s.get("width")
             self.src_height = s.get("height")
             t = (s.get("color_transfer") or "unknown").lower()
+            primaries = (s.get("color_primaries") or "unknown").lower()
+            # ffprobe's stream field is (confusingly) named "color_space" for
+            # the matrix coefficients, not a colour space in the everyday
+            # sense - it's the bt709/bt2020nc/etc. value used to convert
+            # YUV<->RGB, distinct from both transfer (PQ/HLG/gamma curve)
+            # and primaries (gamut).
+            matrix = (s.get("color_space") or "unknown").lower()
             bit_depth = s.get("bits_per_raw_sample")
             if not bit_depth:
                 # Fall back to reading it out of the pix_fmt name (e.g.
@@ -1553,6 +1726,7 @@ class MainWindow(QWidget):
                 pf = (s.get("pix_fmt") or "")
                 bit_depth = next((n for n in ("12", "10") if n in pf), "8")
             raw = json.dumps(s).lower()
+            self._last_analysis_raw = raw
             if "dovi" in raw or "dolby vision" in raw:
                 self.kind = "dolby"
                 note = "Dolby Vision detected. A compatible HDR10 base layer is required for dependable SDR output."
@@ -1564,32 +1738,204 @@ class MainWindow(QWidget):
                 note = "Likely SDR/Rec.709. Tone mapping is normally unnecessary."
             dur_note = f"{format_time(self.duration)} ({self.duration:.0f}s)" if self.duration else "unknown (progress/ETA will be limited)"
             rec = self._recommend(self.kind, raw)
-            self.analysis_label.setText(f"{note} Transfer: {t}; bit depth: {bit_depth}-bit; duration: {dur_note}. {rec}")
+            src_cs = (f"{TRANSFER_NAMES.get(t, t)} \u00b7 {PRIMARIES_NAMES.get(primaries, primaries)} primaries "
+                      f"\u00b7 {MATRIX_NAMES.get(matrix, matrix)} matrix \u00b7 {bit_depth}-bit")
+            # This app always tone-maps *to* BT.709 primaries/transfer/matrix
+            # - that fixed combination is what "SDR" means here, so there's
+            # no target picker to show; this line just states that fixed
+            # destination next to whatever the source actually is.
+            cs_line = f"Source: {src_cs} \u2192 Target: BT.709 \u00b7 BT.709 \u00b7 BT.709 (SDR)"
+            warn = ""
+            if self.kind == "hdr" and primaries not in ("bt2020", "unknown"):
+                warn = (f" Note: source primaries are {PRIMARIES_NAMES.get(primaries, primaries)}, not the usual "
+                        "BT.2020 - tone mapping assumes a BT.2020 gamut, so colours may be off.")
+            # Full explanation - kept as a tooltip rather than shown inline;
+            # in practice almost nobody reads a 4-sentence paragraph in a
+            # side-panel card, so the label itself shows a compact,
+            # scannable summary instead (headline + two labelled sections)
+            # and this goes on hover for anyone who wants the whole story,
+            # the same show-compact/hover-for-detail pattern already used
+            # for the tone-mapping dropdown.
+            self.analysis_label.setToolTip(f"{note} {cs_line}. Duration: {dur_note}. {rec}{warn}")
+            t_col = THEMES[self.theme_name]
+            headline = {"hdr": "HDR detected", "sdr": "SDR / Rec.709 detected", "dolby": "Dolby Vision detected"}[self.kind]
+            headline_color = t_col["AMBER"] if self.kind == "dolby" else t_col["INDIGO"]
+            res = f"{self.src_width}\u00d7{self.src_height} \u00b7 " if self.src_width and self.src_height else ""
+            src_short = f"{res}{TRANSFER_NAMES.get(t, t)} \u00b7 {PRIMARIES_NAMES.get(primaries, primaries)} \u00b7 {bit_depth}-bit"
+            dur_short = format_time(self.duration) if self.duration else "unknown duration"
+            muted = t_col["MUTED"]
+            lines = [f"<b style='color:{headline_color}'>{headline}</b>"]
+            lines.append(f"<b style='color:{muted}'>Source file</b>")
+            lines.append(f"&nbsp;&nbsp;{src_short} \u00b7 {dur_short}")
+            lines.append(f"<b style='color:{muted}'>Recommended settings</b>")
+            lines.append(f"&nbsp;&nbsp;<b>Optimal</b> \u2014 {self._optimal_note(self.kind, raw)}")
+            lines.append(f"&nbsp;&nbsp;<b>Best quality</b> \u2014 {self._best_quality_note()}")
+            lines.append(f"&nbsp;&nbsp;<b>Fast</b> \u2014 {self._fast_note()}")
+            if warn:
+                lines.append(f"<span style='color:{t_col['AMBER']}'>\u26a0 primaries are "
+                              f"{PRIMARIES_NAMES.get(primaries, primaries)}, not BT.2020 \u2014 colours may be off</span>")
+            self.analysis_label.setText("<br>".join(lines))
+            for b in (self.preset_optimal_btn, self.preset_best_btn, self.preset_fast_btn):
+                b.setEnabled(True)
             self.update_bitrate_estimate()
             self._schedule_frame_preview()
         except UnicodeDecodeError as e:
+            self._last_analysis_raw = None
+            for b in (self.preset_optimal_btn, self.preset_best_btn, self.preset_fast_btn):
+                b.setEnabled(False)
+            self.analysis_label.setToolTip("")
             self.analysis_label.setText(f"Analysis failed reading ffprobe's output ({e}). "
                                          "This is usually a corrupted/unusual metadata tag in the file itself, "
                                          "not a problem with the video streams - conversion can often still proceed.")
         except Exception as e:
+            self._last_analysis_raw = None
+            for b in (self.preset_optimal_btn, self.preset_best_btn, self.preset_fast_btn):
+                b.setEnabled(False)
+            self.analysis_label.setToolTip("")
             self.analysis_label.setText(f"Analysis failed: {e}")
 
+    def _optimal_note(self, kind, raw):
+        """What 'Optimal' means for this source - almost always just a
+        confirmation that the app's own defaults already fit, since that's
+        what those defaults are chosen for."""
+        if kind == "sdr":
+            return "tone mapping off \u2014 already the default for non-HDR sources"
+        if kind == "dolby":
+            return "BT.2390 \u00b7 GPU, same as HDR \u2014 needs a usable HDR10 base layer"
+        has_hdr10plus = any(m in raw for m in ("smpte2094-40", "hdr10+", "hdr dynamic metadata"))
+        if has_hdr10plus and self.has_bt2390 and self.has_st2094:
+            return "ST2094-40 \u00b7 Pro mode \u2014 matches this source's HDR10+ metadata"
+        if self.has_bt2390:
+            return "BT.2390 \u00b7 GPU \u2014 already the app default"
+        return "Hable \u00b7 CPU \u2014 BT.2390/libplacebo unavailable in this FFmpeg build"
+
+    def _best_quality_note(self):
+        return "CPU \u00b7 H.265, Pro mode, low CRF \u2014 slower, highest fidelity"
+
+    def _fast_note(self):
+        """Same hardware-encoder probe as _perf_recommendation(), phrased as
+        the 'trade some quality for speed' tier rather than a full sentence."""
+        gpu_options = [
+            ("NVIDIA NVENC \u00b7 H.265", "hevc_nvenc"),
+            ("AMD AMF \u00b7 H.265", "hevc_amf"),
+            ("Apple VideoToolbox \u00b7 H.265", "hevc_videotoolbox"),
+        ]
+        gpu_hit = next((label for label, enc_id in gpu_options if enc_id in self.encoders), None)
+        if gpu_hit:
+            return f"{gpu_hit} \u2014 hardware, much faster, still solid quality"
+        return f"CPU \u00b7 H.264 or a higher CRF \u2014 no hardware encoder detected ({CPU_COUNT} cores)"
+
+    # ---- one-click preset application --------------------------------
+    def _optimal_curve(self, kind, raw):
+        """(method_combo label, needs_pro_mode) for exactly what
+        _optimal_note() describes in words - kept as the one place that
+        decides this, so the note text and the "Optimal" button can't
+        drift out of sync with each other."""
+        if kind == "sdr":
+            return "None (direct, no tonemap) \u00b7 CPU tonemap", True
+        if kind != "dolby":
+            has_hdr10plus = any(m in raw for m in ("smpte2094-40", "hdr10+", "hdr dynamic metadata"))
+            if has_hdr10plus and self.has_bt2390 and self.has_st2094:
+                return "ST2094-40 (HDR10+) \u00b7 GPU libplacebo/Vulkan (FFmpeg only)", True
+        if self.has_bt2390:
+            return "BT.2390 \u00b7 GPU libplacebo/Vulkan (FFmpeg only)", False
+        return "Hable \u00b7 CPU tonemap", False
+
+    def _select_curve(self, label, need_pro):
+        """Applies a method_combo selection, turning Pro mode on first if
+        the curve needs it (toggle_pro_mode's own signal handler already
+        repopulates method_combo's item list synchronously, so it's ready
+        by the time we get to setCurrentText). Falls back to Hable - always
+        present regardless of backend/Pro mode - if the requested label
+        isn't actually a valid option right now (e.g. a GPU curve while the
+        HandBrake backend is selected, which never offers libplacebo)."""
+        if need_pro and not self.pro_mode_chk.isChecked():
+            self.pro_mode_chk.setChecked(True)
+        if self.method_combo.findText(label) < 0:
+            label = "Hable \u00b7 CPU tonemap"
+        self.method_combo.setCurrentText(label)
+
+    def _apply_optimal_preset(self):
+        if self.kind == "unknown" or self._last_analysis_raw is None:
+            return
+        label, need_pro = self._optimal_curve(self.kind, self._last_analysis_raw)
+        self._select_curve(label, need_pro)
+        self.write(f"[preset] Optimal applied: {self.method_combo.currentText()}\n")
+
+    def _apply_best_quality_preset(self):
+        if self.kind == "unknown" or self._last_analysis_raw is None:
+            return
+        label, _ = self._optimal_curve(self.kind, self._last_analysis_raw)
+        self._select_curve(label, True)  # Best quality always wants Pro mode + the best available curve
+        if self.encoder_combo.findText("CPU \u00b7 H.265") >= 0:
+            self.encoder_combo.setCurrentText("CPU \u00b7 H.265")
+        self.quality_spin.setValue(16)  # low CRF - matches _best_quality_note()'s promise
+        self.write(f"[preset] Best quality applied: {self.encoder_combo.currentText()}, "
+                   f"{self.method_combo.currentText()}, CRF {self.quality_spin.value()}\n")
+
+    def _apply_fast_preset(self):
+        if self.kind == "unknown" or self._last_analysis_raw is None:
+            return
+        gpu_options = [
+            ("NVIDIA NVENC \u00b7 H.265", "hevc_nvenc"),
+            ("AMD AMF \u00b7 H.265", "hevc_amf"),
+            ("Apple VideoToolbox \u00b7 H.265", "hevc_videotoolbox"),
+        ]
+        gpu_hit = next((label for label, enc_id in gpu_options if enc_id in self.encoders), None)
+        target = gpu_hit if gpu_hit and self.encoder_combo.findText(gpu_hit) >= 0 else "CPU \u00b7 H.264"
+        if self.encoder_combo.findText(target) >= 0:
+            self.encoder_combo.setCurrentText(target)
+        if self.pro_mode_chk.isChecked():
+            self.pro_mode_chk.setChecked(False)  # also resets quality_spin's range/value to the simple default
+        if target.startswith("CPU"):
+            self.quality_spin.setValue(23)  # a bit higher than the default 18 - "or a higher CRF" per _fast_note()
+        # GPU tone-mapping is itself hardware-accelerated and cheap even
+        # though it's not required for speed, so prefer it when available;
+        # Hable is the lightest CPU curve otherwise.
+        label = "BT.2390 \u00b7 GPU libplacebo/Vulkan (FFmpeg only)" if self.has_bt2390 else "Hable \u00b7 CPU tonemap"
+        self._select_curve(label, False)
+        self.write(f"[preset] Fast applied: {self.encoder_combo.currentText()}, {self.method_combo.currentText()}\n")
+
     def _recommend(self, kind, raw):
-        """A short, honest steer toward the setting most likely to fit this
-        specific source - not a hard rule, just what the analysis already
-        gathered pointing somewhere useful instead of sitting unused."""
+        """A short, honest steer toward the settings most likely to fit this
+        specific source and this machine - not a hard rule, just what the
+        analysis and the capability probe already gathered pointing
+        somewhere useful instead of sitting unused."""
+        perf = self._perf_recommendation()
         if kind == "sdr":
             return ("Tone mapping isn't really needed here - if you convert anyway, a gentle CPU tonemap "
-                    "curve (or Pro mode \u2192 None) is safer than forcing BT.2390 on non-HDR footage.")
+                    f"curve (or Pro mode \u2192 None) is safer than forcing BT.2390 on non-HDR footage. {perf}")
         if kind == "dolby":
-            return "Results depend on this file having a usable HDR10 base layer - if the output looks off, that's the likely reason."
+            return ("Results depend on this file having a usable HDR10 base layer - if the output looks "
+                    f"off, that's the likely reason. {perf}")
         # kind == "hdr"
         has_hdr10plus = any(m in raw for m in ("smpte2094-40", "hdr10+", "hdr dynamic metadata"))
         if has_hdr10plus and self.has_bt2390 and self.has_st2094:
-            return "This source carries HDR10+ dynamic metadata - enable Pro mode and pick ST2094-40 for the most accurate result."
-        if self.has_bt2390:
-            return "BT.2390 on GPU (the default) is a good fit for this source."
-        return "This FFmpeg build has no usable BT.2390/libplacebo - Hable (CPU tonemap) is the best curve available here."
+            curve = "This source carries HDR10+ dynamic metadata - enable Pro mode and pick ST2094-40 for the most accurate result."
+        elif self.has_bt2390:
+            curve = "BT.2390 on GPU (the default) is a good fit for this source."
+        else:
+            curve = "This FFmpeg build has no usable BT.2390/libplacebo - Hable (CPU tonemap) is the best curve available here."
+        return f"{curve} {perf}"
+
+    def _perf_recommendation(self):
+        """Speed-vs-quality steer built from the same self.encoders
+        capability probe the encoder dropdown filtering already uses, so
+        it's specific to what this machine's FFmpeg build can actually
+        reach rather than a generic tip that may not apply."""
+        gpu_options = [
+            ("NVIDIA NVENC \u00b7 H.265", "hevc_nvenc"),
+            ("AMD AMF \u00b7 H.265", "hevc_amf"),
+            ("Apple VideoToolbox \u00b7 H.265", "hevc_videotoolbox"),
+        ]
+        gpu_hit = next((label for label, enc_id in gpu_options if enc_id in self.encoders), None)
+        if gpu_hit:
+            return (f"For speed with still-solid quality, this machine has {gpu_hit} available \u2014 much "
+                     "faster than CPU encoding. For the best achievable quality (at the cost of encode "
+                     "time), use CPU \u00b7 H.265 with Pro mode and a low CRF instead.")
+        return (f"No hardware encoder was detected here, so encoding runs on the CPU ({CPU_COUNT} cores "
+                 "available) \u2014 CPU \u00b7 H.265 gives the best quality; CPU \u00b7 H.264, a higher CRF, "
+                 "or limiting cores less aggressively trades some quality for shorter encode times.")
 
     # ---- command builders --------------------------------------------
     def scale_args_ffmpeg(self):
@@ -1635,66 +1981,65 @@ class MainWindow(QWidget):
             opts = opts + ["-threads", str(cores)]
         return e, opts
 
-    def build_vf_chain(self):
+    def build_vf_chain(self, fmt="yuv420p"):
         """The exact tonemap + scale + brightness filter chain used for the
         real encode. Shared with the instant frame-preview render below so
-        the preview is provably the same pipeline, not a lookalike."""
+        the preview is provably the same pipeline, not a lookalike.
+
+        `fmt` is the pixel format the tonemap/format filter converts into -
+        pass the selected bit depth's pix_fmt here directly rather than
+        building with a hardcoded "yuv420p" and patching the string
+        afterwards (the previous approach relied on "format=yuv420p"
+        appearing exactly once in the chain, which is easy to silently
+        break if the chain is ever edited)."""
         engine, code = self.tonemap_lookup()
         if engine == "gpu":
-            vf = f"libplacebo=tonemapping={code}:colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv:format=yuv420p"
+            vf = f"libplacebo=tonemapping={code}:colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv:format={fmt}"
         else:
-            vf = f"zscale=t=linear:npl=100,format=gbrpf32le,tonemap=tonemap={code}:desat=0,zscale=p=bt709:t=bt709:m=bt709:r=tv,format=yuv420p"
+            vf = f"zscale=t=linear:npl=100,format=gbrpf32le,tonemap=tonemap={code}:desat=0,zscale=p=bt709:t=bt709:m=bt709:r=tv,format={fmt}"
         vf += self.scale_args_ffmpeg()
         vf += self.brightness_args_ffmpeg()
         return vf
 
     def command_ffmpeg(self):
         e, opt = self.encode()
+        fmt, _ = FFMPEG_BIT_DEPTH[self.bit_depth_combo.currentText()]
         base = [exe("ffmpeg"), "-hide_banner", "-y"]
         if self.hwaccel_chk.isChecked():
             base += ["-hwaccel", "auto"]
         base += ["-progress", "pipe:1", "-nostats", "-i", self.src_edit.text()]
-        vf = self.build_vf_chain()
-        main_out = [
-            "-map", "[enc]", "-map", "0:a?", "-c:v", e, *opt, "-c:a", "copy",
-            "-movflags", "+faststart", self.dst_edit.text(),
-        ]
+        vf = self.build_vf_chain(fmt)
         if self.preview_path is None:
             # No live preview requested (shouldn't normally happen for the
             # FFmpeg backend, but fall back to the plain single-output form).
-            cmd = base + ["-map", "0:v:0", "-map", "0:a?", "-vf", vf, "-c:v", e, *opt, "-c:a", "copy",
-                           "-movflags", "+faststart", self.dst_edit.text()]
-            return self._apply_bit_depth_ffmpeg(cmd)
+            return base + ["-map", "0:v:0", "-map", "0:a?", "-vf", vf, "-c:v", e, *opt,
+                            "-pix_fmt", fmt, "-c:a", "copy",
+                            "-movflags", "+faststart", self.dst_edit.text()]
+        main_out = [
+            "-map", "[enc]", "-map", "0:a?", "-c:v", e, *opt, "-pix_fmt", fmt, "-c:a", "copy",
+            "-movflags", "+faststart", self.dst_edit.text(),
+        ]
         # Split the tone-mapped output: full-res branch goes to the encoder,
-        # a small/low-fps branch continuously overwrites a JPEG the GUI polls
-        # for the Live Preview panel - so the preview is a real frame from
-        # the same pipeline, not a separate re-read of the HDR source.
+        # a low-fps branch continuously overwrites a JPEG the GUI polls for
+        # the Live Preview panel - so the preview is a real frame from the
+        # same pipeline, not a separate re-read of the HDR source. Capped at
+        # 1600px wide rather than left at the full output resolution: at
+        # only 1fps the cap barely matters for cost, but an uncapped source
+        # (e.g. 8K "Source, no scaling") would otherwise write a huge JPEG
+        # once a second for the whole encode. 1600 is still a large jump up
+        # from a plain thumbnail, so "View full size"/"Save frame" hold up
+        # against a 4K source instead of just upscaling a postage stamp.
         # The extra "format=yuvj420p" on the preview branch is deliberate:
-        # _apply_bit_depth_ffmpeg() below bumps the main format=yuv420p up to
-        # 10/12-bit when that's selected, and MJPEG can only encode 8-bit -
-        # without forcing it back down here, ffmpeg crashes outright (access
-        # violation) instead of erroring cleanly when the preview branch hits
-        # the mjpeg encoder with a pixel format it can't handle.
-        fc = f"[0:v]{vf}[tm];[tm]split=2[enc][pv];[pv]fps=1,scale=320:-1,format=yuvj420p[pvout]"
+        # the main branch's format= may be 10/12-bit when that's selected,
+        # and MJPEG can only encode 8-bit - without forcing it back down
+        # here, ffmpeg crashes outright (access violation) instead of
+        # erroring cleanly when the preview branch hits the mjpeg encoder
+        # with a pixel format it can't handle.
+        fc = (f"[0:v]{vf}[tm];[tm]split=2[enc][pv];"
+              f"[pv]fps=1,scale=w='min(iw\\,1600)':h=-2:flags=lanczos,format=yuvj420p[pvout]")
         preview_out = ["-map", "[pvout]", "-f", "image2", "-update", "1",
-                        "-q:v", "4", "-c:v", "mjpeg", str(self.preview_path)]
-        cmd = base + ["-filter_complex", fc] + main_out + preview_out
-        return self._apply_bit_depth_ffmpeg(cmd)
-
-    def _apply_bit_depth_ffmpeg(self, cmd):
-        """Bump the encode branch's pixel format to the selected bit depth
-        and tell the encoder about it via -pix_fmt. The -filter_complex/-vf
-        argument (whichever this command used) contains exactly one
-        "format=yuv420p" - the one right before the encode/split point -
-        regardless of which branch built it, so this can run unconditionally
-        as a last step rather than needing its own copy in each branch."""
-        fmt, _ = FFMPEG_BIT_DEPTH[self.bit_depth_combo.currentText()]
-        key = "-filter_complex" if "-filter_complex" in cmd else "-vf"
-        idx = cmd.index(key) + 1
-        cmd[idx] = cmd[idx].replace("format=yuv420p", f"format={fmt}")
-        insert_at = cmd.index("-c:a")
-        cmd[insert_at:insert_at] = ["-pix_fmt", fmt]
-        return cmd
+                        "-q:v", "2", "-c:v", "mjpeg", str(self.preview_path)]
+        return base + ["-filter_complex", fc] + main_out + preview_out
 
     def command_handbrake(self):
         label = self.encoder_combo.currentText()
@@ -1702,8 +2047,14 @@ class MainWindow(QWidget):
         ids = HB_ENCODER_IDS.get(label, {})
         # Should always be a hit given _on_bit_depth_changed already limits
         # encoder_combo to labels valid at this depth - the 8-bit id is a
-        # defensive fallback only, not an expected path.
-        e = ids.get(depth) or ids.get("8-bit (SDR standard)")
+        # defensive fallback only, not an expected path. If it's ever hit
+        # anyway, say so in the log instead of silently swapping in 8-bit
+        # output for what the UI showed as a 10/12-bit selection.
+        e = ids.get(depth)
+        if e is None:
+            e = ids.get("8-bit (SDR standard)")
+            self.write(f"[warn] {label} has no {depth} encoder id in this build \u2014 "
+                       f"falling back to 8-bit output.\n")
         cmd = [self.handbrake_tool, "-i", self.src_edit.text(), "-o", self.dst_edit.text(),
                "-e", e, "-q", str(self.quality_spin.value()), "-M", "709", "-E", "copy"]
         # HandBrake's --colorspace filter only runs its zscale+tonemap chain
@@ -2080,6 +2431,136 @@ class MainWindow(QWidget):
         self.preview_expand_btn.setEnabled(True)
         self.preview_save_btn.setEnabled(True)
 
+    # ---- short test-clip render -----------------------------------
+    def _test_clip_command(self, out_path):
+        """A ~5s real encode through the exact backend/settings that will
+        be used for the real conversion, so - unlike the instant still
+        frame above - it also stands in for a live preview on the
+        HandBrake backend and shows motion/real encoded quality."""
+        seek = max(0.0, (self.duration or 10.0) / 2 - 2.5)
+        using_hb = self.backend_combo.currentText().startswith("HandBrake")
+        src = self.src_edit.text()
+        if using_hb:
+            label = self.encoder_combo.currentText()
+            depth = self.bit_depth_combo.currentText()
+            ids = HB_ENCODER_IDS.get(label, {})
+            e = ids.get(depth) or ids.get("8-bit (SDR standard)")
+            cmd = [self.handbrake_tool, "-i", src, "-o", str(out_path),
+                   "-e", e, "-q", str(self.quality_spin.value()), "-M", "709", "-E", "copy",
+                   "--start-at", f"duration:{seek:.1f}", "--stop-at", "duration:5"]
+            engine, code = self.tonemap_lookup()
+            if engine == "cpu":
+                cmd += ["--colorspace", f"transfer=bt709:tonemap={code}:desat=0"]
+            target_h = RESOLUTIONS.get(self.res_combo.currentText())
+            if target_h:
+                cmd += ["-Y", str(even(target_h))]
+            if self.hwaccel_chk.isChecked() and e.startswith("nvenc"):
+                cmd += ["--enable-hw-decoding", "nvdec"]
+            profile = HB_PROFILE_FOR_DEPTH.get(depth)
+            if profile and depth in ids:
+                cmd += ["--encoder-profile", profile]
+            return cmd
+        e, opt = self.encode()
+        fmt, _ = FFMPEG_BIT_DEPTH[self.bit_depth_combo.currentText()]
+        vf = self.build_vf_chain(fmt)
+        cmd = [exe("ffmpeg"), "-hide_banner", "-y"]
+        if self.hwaccel_chk.isChecked():
+            cmd += ["-hwaccel", "auto"]
+        cmd += ["-ss", f"{seek:.2f}", "-i", src, "-t", "5", "-vf", vf,
+                "-c:v", e, *opt, "-pix_fmt", fmt, "-c:a", "copy",
+                "-movflags", "+faststart", str(out_path)]
+        return cmd
+
+    def _set_test_clip_status(self, text):
+        self.test_clip_status.setText(text)
+        self.test_clip_status.setVisible(bool(text))
+
+    def _run_test_clip(self):
+        if self._test_clip_proc is not None:
+            # Second click while one is running: treat it as cancel.
+            self._test_clip_proc.kill()
+            self._test_clip_proc = None
+            self.test_clip_btn.setText("\u25b6")
+            set_role(self.test_clip_btn, "icon-btn")
+            self.test_clip_btn.setToolTip(
+                "Render 5s test clip \u2014 encode a short real clip from the middle of the "
+                "source with the current settings, through the backend that will be used "
+                "for the full conversion, so you can check quality and motion first.")
+            self._set_test_clip_status("Test clip render cancelled.")
+            return
+        if self.proc is not None and self.proc.state() == QProcess.ProcessState.Running:
+            QMessageBox.information(self, "Conversion running",
+                                     "Wait for the current conversion to finish first.")
+            return
+        if not Path(self.src_edit.text()).is_file():
+            QMessageBox.critical(self, "Files", "Choose a source file first.")
+            return
+        using_hb = self.backend_combo.currentText().startswith("HandBrake")
+        if using_hb:
+            if not self.handbrake_tool:
+                QMessageBox.critical(self, "HandBrakeCLI not found",
+                                      "Install HandBrakeCLI and ensure it's on PATH, or switch the backend to FFmpeg.")
+                return
+            ext = Path(self.dst_edit.text()).suffix.lower()
+            ext = ext if ext in (".mp4", ".mkv") else ".mp4"
+        else:
+            if not exe("ffmpeg"):
+                QMessageBox.critical(self, "FFmpeg", "FFmpeg is required.")
+                return
+            ext = Path(self.dst_edit.text()).suffix or ".mp4"
+        src_path = Path(self.src_edit.text())
+        # Next to the source by default, like a "quick look" export would -
+        # falls back to the system temp dir only if that folder genuinely
+        # isn't writable (e.g. a read-only media mount).
+        out_dir = src_path.parent
+        if not os.access(out_dir, os.W_OK):
+            out_dir = Path(tempfile.gettempdir())
+        out = out_dir / f"{src_path.stem}_test_clip{ext}"
+        out.unlink(missing_ok=True)
+        cmd = self._test_clip_command(out)
+        proc = QProcess(self)
+        proc.setProgram(cmd[0])
+        proc.setArguments(cmd[1:])
+        proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        proc.readyReadStandardOutput.connect(lambda p=proc: self.write(
+            bytes(p.readAllStandardOutput()).decode(errors="replace")))
+        proc.finished.connect(lambda *_args, out=out: self._on_test_clip_finished(out))
+        self._test_clip_proc = proc
+        self._test_clip_out = None
+        self.test_clip_open_btn.setEnabled(False)
+        set_role(self.test_clip_open_btn, "icon-btn")
+        self.test_clip_open_btn.setToolTip(
+            "Open test clip \u2014 no test clip rendered yet. Turns green once one is ready to play.")
+        self.test_clip_btn.setText("\u2715")
+        set_role(self.test_clip_btn, "icon-btn-busy")
+        self.test_clip_btn.setToolTip("Cancel the test clip render currently in progress.")
+        self._set_test_clip_status("Rendering a 5s test clip with the current settings\u2026")
+        proc.start()
+
+    def _on_test_clip_finished(self, out):
+        was_current = self._test_clip_proc is not None
+        self._test_clip_proc = None
+        self.test_clip_btn.setText("\u25b6")
+        set_role(self.test_clip_btn, "icon-btn")
+        self.test_clip_btn.setToolTip(
+            "Render 5s test clip \u2014 encode a short real clip from the middle of the "
+            "source with the current settings, through the backend that will be used "
+            "for the full conversion, so you can check quality and motion first.")
+        if not was_current:
+            return  # cancelled - out may be a half-written/deleted file
+        if not out.exists() or out.stat().st_size == 0:
+            self._set_test_clip_status("Test clip render failed \u2014 check the Activity log for details.")
+            return
+        self._test_clip_out = out
+        self.test_clip_open_btn.setEnabled(True)
+        set_role(self.test_clip_open_btn, "icon-btn-ready")
+        self.test_clip_open_btn.setToolTip(f"Open test clip \u2014 ready: {out}")
+        self._set_test_clip_status("")
+
+    def _open_test_clip(self):
+        if self._test_clip_out and self._test_clip_out.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._test_clip_out)))
+
     def show_preview_fullscreen(self):
         pix = self._current_preview_pixmap
         if pix is None or pix.isNull():
@@ -2137,7 +2618,9 @@ class MainWindow(QWidget):
                 if not img.isNull():
                     pix = QPixmap.fromImage(img)
                     self._current_preview_pixmap = pix
-                    self.preview_label.setPixmap(pix)
+                    self.preview_label.setPixmap(pix.scaled(
+                        max(self.preview_label.width(), 320), 260,
+                        Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
                     self._update_preview_meta(img)
                     self.preview_expand_btn.setEnabled(True)
                     self.preview_save_btn.setEnabled(True)
@@ -2250,10 +2733,29 @@ class MainWindow(QWidget):
         if self.proc and self.stopping and self.proc.state() == QProcess.ProcessState.Running:
             self.proc.kill()
 
+    def eventFilter(self, obj, event):
+        # Keeps the displayed preview frame scaled to whatever space it
+        # currently has - not just on the next poll/render tick, but
+        # immediately on any resize. This matters more than a plain
+        # QWidget.resizeEvent override would catch: dragging the
+        # left/right QSplitter handle (the everyday way this panel gets
+        # narrower) resizes preview_label directly without the top-level
+        # window itself being resized, so a MainWindow-level resizeEvent
+        # would miss it entirely.
+        if obj is self.preview_label and event.type() == QEvent.Type.Resize:
+            cur = self.preview_label.pixmap()
+            if cur is not None and not cur.isNull() and self._current_preview_pixmap is not None:
+                self.preview_label.setPixmap(self._current_preview_pixmap.scaled(
+                    max(self.preview_label.width(), 320), 260,
+                    Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        return super().eventFilter(obj, event)
+
     def closeEvent(self, event):
-        if self.proc and self.proc.state() == QProcess.ProcessState.Running:
-            self.proc.kill()
-            self.proc.waitForFinished(1000)
+        for p in (self.proc, self._frame_preview_proc, self._test_clip_proc,
+                  getattr(self, "_setup_proc", None)):
+            if p is not None and p.state() == QProcess.ProcessState.Running:
+                p.kill()
+                p.waitForFinished(1000)
         event.accept()
 
     # ---- drag-and-drop (whole window accepts a dropped video) -----------
@@ -2271,9 +2773,15 @@ class MainWindow(QWidget):
             event.acceptProposedAction()
 
     def dropEvent(self, event):
-        urls = event.mimeData().urls()
-        if urls:
-            self._set_source(urls[0].toLocalFile())
+        urls = event.mimeData().urls() if event.mimeData().hasUrls() else []
+        path = urls[0].toLocalFile() if urls else ""
+        if not path or Path(path).suffix.lower() not in self.VIDEO_EXTS:
+            event.ignore()
+            return
+        if self.proc and self.proc.state() == QProcess.ProcessState.Running:
+            event.ignore()
+            return
+        self._set_source(path)
         event.acceptProposedAction()
 
 
