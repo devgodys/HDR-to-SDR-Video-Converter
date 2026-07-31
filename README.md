@@ -54,12 +54,32 @@ Three genuinely different pipelines, not one "auto" button:
 |---|---|
 | Python 3.10+ | Running the app itself |
 | PySide6 | The Qt-based UI |
-| FFmpeg | Standard and GPU tone-mapping backends |
+| FFmpeg *(full/GPL build, with libx264 + libx265)* | Standard and GPU tone-mapping backends |
 | Vulkan-capable GPU + drivers | The libplacebo/BT.2390 backend specifically |
 | HandBrakeCLI *(optional)* | The experimental HandBrake backend |
 | psutil *(optional)* | Live pause/resume, CPU-core control, resource stats |
 
-On Windows, missing FFmpeg/HandBrakeCLI can be installed automatically from inside the app via `winget` — see the System panel, or the "Quick install" shortcut in the header.
+On Windows, missing FFmpeg/HandBrakeCLI can be installed automatically from inside the app via `winget` — see the System panel, or the "Quick install" shortcut in the header. This pulls the right build automatically, so you don't need to hunt for the correct FFmpeg variant yourself; see [Dependencies & licensing](#dependencies--licensing) below for exactly what gets installed and from where.
+
+## Dependencies & licensing
+
+This app doesn't bundle FFmpeg or HandBrakeCLI — they're installed on your
+own machine, straight from their authors' official channels, via `winget`:
+
+| Tool | Source | winget package ID | License |
+|---|---|---|---|
+| FFmpeg | [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) full build | `Gyan.FFmpeg` | GPLv3 |
+| HandBrakeCLI | [HandBrake](https://handbrake.fr) official release | `HandBrake.HandBrake.CLI` | GPLv2 |
+
+Both are excellent, independent open-source projects — full credit to their
+authors and contributors. This app is a GUI front end that shells out to
+them as separate processes; it doesn't modify, link against, or redistribute
+their code, and each keeps its own license regardless of this project's MIT
+license (see [License](#license) below).
+
+Prefer to install them yourself instead of using the in-app installer? That
+works too — the app just looks for `ffmpeg`, `ffprobe`, and `HandBrakeCLI`
+on your `PATH`.
 
 ## Install & run
 
@@ -88,14 +108,34 @@ Or grab a prebuilt Windows `.exe` from the [latest release](https://github.com/g
 
 ```bash
 pip install pyinstaller
-pyinstaller --windowed --onefile --icon=icon.ico hdr_to_sdr_gui_qt.py
+pyinstaller --windowed --onefile --icon=icon.ico \
+  --add-data "icon.ico:." \
+  --add-data "icons:icons" \
+  hdr_to_sdr_gui_qt.py
 ```
 
-Drop `icon.ico` next to the script beforehand and it's picked up automatically, both in-app and as the exe's file icon. There's only one entry point — 10-bit/12-bit output is part of the same build, not a separate exe.
+Drop `icon.ico` *and* an `icons/` folder (containing `icon-<size>.png` files,
+e.g. `icon-16.png`, `icon-32.png`, `icon-256.png`) next to the script
+beforehand — both are picked up automatically, in-app and as the exe's file
+icon. `--icon=icon.ico` alone only sets the compiled exe's *own* file icon;
+the `--add-data` flags are what let the running app find `icon.ico`/`icons/`
+at runtime for its title bar and taskbar icon. On Windows, use `;` instead
+of `:` as the `--add-data` separator:
+
+```bat
+pyinstaller --windowed --onefile --icon=icon.ico ^
+  --add-data "icon.ico;." ^
+  --add-data "icons;icons" ^
+  hdr_to_sdr_gui_qt.py
+```
+
+There's only one entry point — 10-bit/12-bit output is part of the same
+build, not a separate exe.
 
 ## Troubleshooting
 
 - **BT.2390 (GPU) option greyed out** — no Vulkan-capable device was detected; use a Standard FFmpeg curve instead.
+- **"Encoder unavailable" for CPU · H.264/H.265** — you likely have an LGPL/"essentials" FFmpeg build without `libx264`/`libx265`. Use the in-app **Quick install** (installs the full GPL build automatically), or grab the "full" build yourself from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/).
 - **HandBrakeCLI backend missing** — it's optional and only appears once HandBrakeCLI is found on your PATH.
 - **Conversion feels like it's taking over the machine** — drop Process priority to Efficiency, or lower the CPU-core count live during a run.
 
