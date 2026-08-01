@@ -7,7 +7,7 @@ A desktop tone-mapping tool for people who care which curve they're using — st
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![grandma approved](https://img.shields.io/badge/grandma-approved-ff69b4)
 
-**[Website](https://openhdrtosdr.com/)** · **[Latest release](https://github.com/godysdev/Open-HDR-to-SDR-convertor/releases/latest)**
+**[Website](https://openhdrtosdr.com/)** · **[Latest release](https://github.com/godysdev/HDR-to-SDR-Movie-convertor/releases/latest)**
 
 ![Light mode](webassets/app-screenshot-light.png)
 
@@ -84,13 +84,13 @@ on your `PATH`.
 ## Install & run
 
 ```bash
-git clone https://github.com/godysdev/Open-HDR-to-SDR-convertor.git
-cd Open-HDR-to-SDR-convertor
+git clone https://github.com/godysdev/HDR-to-SDR-Movie-convertor.git
+cd HDR-to-SDR-Movie-convertor
 pip install -r requirements.txt
 python hdr_to_sdr_gui_qt.py
 ```
 
-Or grab a prebuilt Windows `.exe` from the [latest release](https://github.com/godysdev/Open-HDR-to-SDR-convertor/releases/latest) — no Python required, though FFmpeg is still needed separately.
+Or grab a prebuilt Windows `.exe` from the [latest release](https://github.com/godysdev/HDR-to-SDR-Movie-convertor/releases/latest) — no Python required, though FFmpeg is still needed separately.
 
 ### 10-bit / 12-bit output
 

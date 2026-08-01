@@ -71,7 +71,7 @@ CPU_COUNT = os.cpu_count() or 4
 
 # Project links shown as small buttons in the header - edit these to match
 # your actual repo/Ko-fi.
-GITHUB_URL = "https://github.com/godysdev/Open-HDR-to-SDR-convertor"
+GITHUB_URL = "https://github.com/godysdev/HDR-to-SDR-Movie-convertor"
 KOFI_URL = "https://ko-fi.com/devgodys"
 
 # ffmpeg -progress emits key=value lines in blocks terminated by a
