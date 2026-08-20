@@ -1,13 +1,13 @@
-# HDR to SDR Movie Converter
+# HDR to SDR Video Converter
 
-A desktop tone-mapping tool for people who care which curve they're using — standard FFmpeg, true BT.2390 on the GPU, or HandBrakeCLI, with the exact command always visible. 10-bit and 12-bit output included, free.
+A desktop tone-mapping tool for people who care which curve they're using — standard FFmpeg, true BT.2390 on the GPU, or HandBrakeCLI, with the exact command always visible. H.264, H.265, and AV1 output, 10-bit and 12-bit included, free.
 
 ![platform](https://img.shields.io/badge/platform-Windows-informational)
 ![python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![grandma approved](https://img.shields.io/badge/grandma-approved-ff69b4)
 
-**[Website](https://openhdrtosdr.com/)** · **[Latest release](https://github.com/godysdev/HDR-to-SDR-Movie-convertor/releases/latest)**
+**[Website](https://openhdrtosdr.com/)** · **[Latest release](https://github.com/devgodys/HDR-to-SDR-Video-Converter/releases/latest)**
 
 ![Light mode](webassets/app-screenshot-light.png)
 
@@ -32,19 +32,21 @@ Three genuinely different pipelines, not one "auto" button:
 ## Features
 
 - **True BT.2390 tone mapping** via libplacebo/Vulkan — not a CPU approximation
-- **10-bit & 12-bit output** — free, no license, no separate build. 10-bit works with any H.265 encoder (CPU or hardware); 12-bit is CPU libx265 only, since no common hardware encoder does 12-bit HEVC
+- **H.264, H.265 and AV1 output** — CPU (x264/x265/SVT-AV1) plus hardware encoders (NVIDIA NVENC, AMD AMF/AMF AV1, Apple VideoToolbox for H.264/H.265). AV1 is royalty-free and typically needs 40-50% fewer bits than H.264 for comparable quality
+- **10-bit & 12-bit output** — free, no license, no separate build. 10-bit works with any H.265/AV1 encoder (CPU or hardware); 12-bit is CPU libx265 only, since no common hardware encoder does 12-bit HEVC
 - **Full curve library** — Hable, Reinhard, Mobius, BT.2446A, ST2094-10/40, Linear, Gamma, Clip, None, each with a hover tooltip explaining its actual tradeoffs
-- **Analyzes automatically** — pick a source and it's read (transfer characteristics, HDR10+/Dolby Vision metadata) and a curve recommended right away, no separate Analyze step; the SDR output path is filled in for you too
+- **Analyzes automatically** — pick a source and it's read (transfer characteristics, color range, HDR10+/Dolby Vision metadata) and a curve recommended right away, no separate Analyze step; the SDR output path is filled in for you too
 - **Live Preview** — a real decoded-and-tone-mapped frame from your source, refreshed as you change settings, with a shadow/highlight clipping check so you can catch a curve crushing detail before committing to a full encode. View it full size or save the frame straight to disk
-- **Live bitrate estimate** — updates automatically as you change quality, resolution, or encoder, so a surprising CRF/resolution combo shows up before you hit Start, not after
-- **Hardware encoding** — CPU (x264/x265), NVIDIA NVENC, AMD AMF, Apple VideoToolbox
+- **Live bitrate estimate** — updates automatically as you change quality, resolution, or encoder (each codec's own CRF scale is accounted for), so a surprising CRF/resolution combo shows up before you hit Start, not after
+- **Hardware encoding** — CPU (x264/x265/SVT-AV1), NVIDIA NVENC, AMD AMF, Apple VideoToolbox
 - **Resolution presets** — Source, 4K, 1440p, 1080p, 720p, 480p, or custom; scaling is height-driven with width computed to match, so non-16:9 sources aren't stretched
 - **Hardware-accelerated decode** — CUDA / DXVA2 / VideoToolbox (FFmpeg backend)
+- **Interface language picker** — English plus a globe menu of other languages (translations load from an optional `i18n/` folder of JSON files; the app runs in English automatically if it isn't present), with a "System default" option that follows Windows' language
 - **Drag and drop** — drop a video file anywhere on the window to set it as the source
 - **Live run controls** — pause/resume, live CPU-core affinity, and process priority, all adjustable mid-conversion
 - **Live resource monitoring** — CPU and GPU usage shown while converting
 - **Activity & System panels** — a live log of the actual FFmpeg/HandBrake output, and a report of what's detected on your system (FFmpeg, Vulkan, HandBrakeCLI) before you convert
-- **One-click Windows setup** — missing FFmpeg/HandBrakeCLI installed via `winget` from inside the app, with a "Quick install" shortcut right in the header so you don't need to open a panel first
+- **One-click Windows setup** — missing FFmpeg/HandBrakeCLI installed via `winget` from inside the app, with a "Quick install" shortcut right in the header so you don't need to open a panel first. If `winget` itself isn't available, the app falls back to downloading the same official portable builds directly (no admin rights needed)
 - **Transparent by design** — the exact command line is always visible, never hidden behind "auto"
 - Light and dark themes
 
@@ -54,28 +56,34 @@ Three genuinely different pipelines, not one "auto" button:
 |---|---|
 | Python 3.10+ | Running the app itself |
 | PySide6 | The Qt-based UI |
-| FFmpeg *(full/GPL build, with libx264 + libx265)* | Standard and GPU tone-mapping backends |
+| FFmpeg *(full/GPL build, with libx264 + libx265 + libsvtav1)* | Standard and GPU tone-mapping backends, plus AV1 output |
 | Vulkan-capable GPU + drivers | The libplacebo/BT.2390 backend specifically |
 | HandBrakeCLI *(optional)* | The experimental HandBrake backend |
 | psutil *(optional)* | Live pause/resume, CPU-core control, resource stats |
+| `i18n/` folder *(optional)* | Non-English interface languages — drop in `<code>.json` files; without it the app runs in English |
 
-On Windows, missing FFmpeg/HandBrakeCLI can be installed automatically from inside the app via `winget` — see the System panel, or the "Quick install" shortcut in the header. This pulls the right build automatically, so you don't need to hunt for the correct FFmpeg variant yourself; see [Dependencies & licensing](#dependencies--licensing) below for exactly what gets installed and from where.
+On Windows, missing FFmpeg/HandBrakeCLI can be installed automatically from inside the app via `winget` — see the System panel, or the "Quick install" shortcut in the header. If `winget` isn't available, the app downloads the same official portable builds directly instead. This pulls the right build automatically, so you don't need to hunt for the correct FFmpeg variant yourself; see [Dependencies & licensing](#dependencies--licensing) below for exactly what gets installed and from where.
 
 ## Dependencies & licensing
 
 This app doesn't bundle FFmpeg or HandBrakeCLI — they're installed on your
-own machine, straight from their authors' official channels, via `winget`:
+own machine, straight from their authors' official channels, via `winget`
+(or downloaded directly as a portable copy when `winget` isn't available):
 
 | Tool | Source | winget package ID | License |
 |---|---|---|---|
 | FFmpeg | [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) full build | `Gyan.FFmpeg` | GPLv3 |
 | HandBrakeCLI | [HandBrake](https://handbrake.fr) official release | `HandBrake.HandBrake.CLI` | GPLv2 |
 
-Both are excellent, independent open-source projects — full credit to their
-authors and contributors. This app is a GUI front end that shells out to
-them as separate processes; it doesn't modify, link against, or redistribute
-their code, and each keeps its own license regardless of this project's MIT
-license (see [License](#license) below).
+AV1 encoding uses SVT-AV1 (`libsvtav1`), which already ships in the same
+FFmpeg full build above — BSD-2-Clause + Patent, part of the Alliance for
+Open Media's royalty-free AV1 ecosystem.
+
+Both FFmpeg and HandBrake are excellent, independent open-source projects —
+full credit to their authors and contributors. This app is a GUI front end
+that shells out to them as separate processes; it doesn't modify, link
+against, or redistribute their code, and each keeps its own license
+regardless of this project's MIT license (see [License](#license) below).
 
 Prefer to install them yourself instead of using the in-app installer? That
 works too — the app just looks for `ffmpeg`, `ffprobe`, and `HandBrakeCLI`
@@ -84,13 +92,13 @@ on your `PATH`.
 ## Install & run
 
 ```bash
-git clone https://github.com/godysdev/HDR-to-SDR-Movie-convertor.git
-cd HDR-to-SDR-Movie-convertor
+git clone https://github.com/devgodys/HDR-to-SDR-Video-Converter.git
+cd HDR-to-SDR-Video-Converter
 pip install -r requirements.txt
 python hdr_to_sdr_gui_qt.py
 ```
 
-Or grab a prebuilt Windows `.exe` from the [latest release](https://github.com/godysdev/HDR-to-SDR-Movie-convertor/releases/latest) — no Python required, though FFmpeg is still needed separately.
+Or grab a prebuilt Windows `.exe` from the [latest release](https://github.com/devgodys/HDR-to-SDR-Video-Converter/releases/latest) — no Python required, though FFmpeg is still needed separately.
 
 ### 10-bit / 12-bit output
 
@@ -98,9 +106,9 @@ Or grab a prebuilt Windows `.exe` from the [latest release](https://github.com/g
 
 ## Basic workflow
 
-1. Pick a **Source** HDR file — analysis runs automatically (transfer function, bit depth, duration, and a curve suggested based on what it finds: plain HDR, HDR10+ metadata, Dolby Vision, or footage that's already SDR), and the **SDR output** path is filled in for you. Drag-and-drop works too.
+1. Pick a **Source** HDR file — analysis runs automatically (transfer function, bit depth, color range, duration, and a curve suggested based on what it finds: plain HDR, HDR10+ metadata, Dolby Vision, or footage that's already SDR), and the **SDR output** path is filled in for you. Drag-and-drop works too.
 2. Choose a **backend** and **curve** — BT.2390 on GPU is the sane default; fall back to Standard FFmpeg without a Vulkan-capable GPU. Hover a curve for a plain-language rundown of what it trades off.
-3. Set **resolution**, **encoder**, and **bit depth**. Leave resolution on "Source" to keep the original frame size and aspect ratio.
+3. Set **resolution**, **encoder** (H.264, H.265, or AV1), and **bit depth**. Leave resolution on "Source" to keep the original frame size and aspect ratio.
 4. Adjust **quality**, or enable **Pro mode** for the full CRF/CQ range, extra curves, and a brightness trim. Check the **Live Preview** panel — it shows an actual tone-mapped frame and flags shadow/highlight clipping, and you can view it full size or save the frame to disk — plus the live bitrate estimate, before committing.
 5. Click **Start** — progress, speed, ETA, and live FFmpeg/HandBrake output are all shown as it runs. Pause/resume, CPU-core limits, and process priority can all be adjusted mid-conversion.
 
@@ -110,7 +118,8 @@ Windows only (this builds a `.exe`, so it has to run on Windows). Drop
 `icon.ico` *and* an `icons/` folder (containing `icon-<size>.png` files,
 e.g. `icon-16.png`, `icon-32.png`, `icon-256.png`) next to the script
 beforehand — both get bundled and are picked up automatically, in-app and
-as the exe's file icon.
+as the exe's file icon. If you're using the interface-language picker,
+also include your `i18n/` folder so translations ship with the build.
 
 ```bat
 pip install pyinstaller
@@ -143,14 +152,14 @@ python -m PyInstaller --noconfirm --windowed --onefile --name "HDR-to-SDR-Conver
   hdr_to_sdr_gui_qt.py
 ```
 
-There's only one entry point — 10-bit/12-bit output is part of the same
-build, not a separate exe.
+There's only one entry point — 10-bit/12-bit output and AV1 support are part of the same build, not a separate exe.
 
 ## Troubleshooting
 
 - **BT.2390 (GPU) option greyed out** — no Vulkan-capable device was detected; use a Standard FFmpeg curve instead.
-- **"Encoder unavailable" for CPU · H.264/H.265** — you likely have an LGPL/"essentials" FFmpeg build without `libx264`/`libx265`. Use the in-app **Quick install** (installs the full GPL build automatically), or grab the "full" build yourself from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/).
+- **"Encoder unavailable" for CPU · H.264/H.265/AV1** — you likely have an LGPL/"essentials" FFmpeg build without `libx264`/`libx265`/`libsvtav1`. Use the in-app **Quick install** (installs the full GPL build automatically), or grab the "full" build yourself from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/).
 - **HandBrakeCLI backend missing** — it's optional and only appears once HandBrakeCLI is found on your PATH.
+- **Interface language not changing** — the app falls back to English for any language without a matching `i18n/<code>.json` file next to the script.
 - **Conversion feels like it's taking over the machine** — drop Process priority to Efficiency, or lower the CPU-core count live during a run.
 
 ## Support

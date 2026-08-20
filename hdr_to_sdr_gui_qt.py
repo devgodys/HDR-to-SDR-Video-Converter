@@ -25,13 +25,13 @@ import sys
 import tempfile
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QProcess, QUrl, QSize, QEvent
-from PySide6.QtGui import QFontDatabase, QFont, QTextCursor, QIcon, QDesktopServices, QPixmap, QImage
+from PySide6.QtCore import Qt, QTimer, QProcess, QUrl, QSize, QEvent, QLocale, QSettings
+from PySide6.QtGui import QAction, QColor, QFontDatabase, QFont, QFontMetrics, QPainter, QPainterPath, QPen, QTextCursor, QIcon, QDesktopServices, QPixmap, QImage
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QLineEdit, QPushButton, QComboBox, QCheckBox,
     QSpinBox, QSlider, QProgressBar, QTextEdit, QGroupBox, QVBoxLayout, QHBoxLayout,
     QGridLayout, QFileDialog, QMessageBox, QFrame, QSplitter, QStackedWidget, QScrollArea,
-    QDialog
+    QDialog, QMenu, QToolButton, QListWidget, QSizePolicy
 )
 
 try:
@@ -67,11 +67,83 @@ THEMES = {
 }
 
 ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+I18N_DIR = ROOT / "i18n"
+PORTABLE_TOOLS_DIR = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / "HDR-to-SDR-Converter" / "tools"
 CPU_COUNT = os.cpu_count() or 4
+
+# ffprobe uses the historical names "tv" and "pc" for video range.  Make
+# the distinction explicit in the analysis panel: it is particularly useful
+# for HDR-to-SDR work, where an unintended full/limited conversion can make
+# blacks look raised or crushed.
+COLOR_RANGE_NAMES = {
+    "tv": "limited range (TV)",
+    "mpeg": "limited range (TV)",
+    "pc": "full range (PC)",
+    "jpeg": "full range (PC)",
+    "unknown": "range not signalled",
+}
+
+
+LANGUAGE_NAMES = {
+    "ar": "العربية", "bg": "Български", "bn": "বাংলা", "de": "Deutsch",
+    "el": "Ελληνικά", "es": "Español", "fa": "فارسی", "fr": "Français",
+    "hi": "हिन्दी", "id": "Bahasa Indonesia", "it": "Italiano", "ja": "日本語",
+    "ko": "한국어", "ms": "Bahasa Melayu", "pl": "Polski", "pt_br": "Português (Brasil)",
+    "ro": "Română", "ru": "Русский", "sr": "Српски", "th": "ไทย",
+    "tl": "Filipino", "tr": "Türkçe", "uk": "Українська", "ur": "اردو",
+    "vi": "Tiếng Việt", "zh_cn": "简体中文",
+}
+
+
+class Localizer:
+    """Loads the bundled Python dictionaries and translates known UI source text."""
+
+    def __init__(self):
+        self.settings = QSettings("DevGodys", "HDR to SDR Video Converter")
+        self.english = self._load("en")
+        self.keys_by_english = {value: key for key, value in self.english.items()}
+        self.language = self._resolve(self.settings.value("interface_language", "system"))
+        self.strings = self._load(self.language) if self.language != "en" else self.english
+
+    @staticmethod
+    def _load(code):
+        path = I18N_DIR / f"{code}.json"
+        if not path.is_file():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    @staticmethod
+    def _system_language():
+        system_code = QLocale.system().name().lower().replace("-", "_")
+        if system_code.startswith("pt"):
+            return "pt_br"
+        if system_code.startswith("zh"):
+            return "zh_cn"
+        base = system_code.split("_", 1)[0]
+        return base if base in LANGUAGE_NAMES else "en"
+
+    def _resolve(self, code):
+        return self._system_language() if code == "system" else code if code in LANGUAGE_NAMES else "en"
+
+    def set_language(self, code):
+        self.settings.setValue("interface_language", code)
+        self.language = self._resolve(code)
+        self.strings = self._load(self.language) if self.language != "en" else self.english
+
+    def text(self, source, **values):
+        key = self.keys_by_english.get(source, source)
+        translated = self.strings.get(key, source)
+        try:
+            return translated.format(**values) if values else translated
+        except (KeyError, ValueError):
+            return translated
 
 # Project links shown as small buttons in the header - edit these to match
 # your actual repo/Ko-fi.
-GITHUB_URL = "https://github.com/godysdev/HDR-to-SDR-Movie-convertor"
+GITHUB_URL = "https://github.com/devgodys/HDR-to-SDR-Video-Converter"
 KOFI_URL = "https://ko-fi.com/devgodys"
 
 # ffmpeg -progress emits key=value lines in blocks terminated by a
@@ -207,14 +279,32 @@ SPIN_WIDTH = 90
 #     than x264/x265 software encoding at a given quality setting, so
 #     they're nudged upward.
 BITRATE_ANCHOR_1080P_H264_CRF23_KBPS = 3500
-CODEC_EFFICIENCY = {"H.264": 1.0, "H.265": 0.60}
+# AV1 needs roughly 40-50% fewer bits than H.264 for comparable quality -
+# similar to or a bit better than H.265, per the usual AV1-vs-H.264/H.265
+# efficiency comparisons (e.g. NVIDIA's own NVENC AV1 benchmarks).
+CODEC_EFFICIENCY = {"H.264": 1.0, "H.265": 0.60, "AV1": 0.50}
+# CRF "center" (this codec's own typical/default value) and how many CRF
+# steps double/halve the bitrate - both differ per codec's own quantizer
+# scale, not just its bit-efficiency (that's CODEC_EFFICIENCY, above).
+# H.264/H.265 share the classic x264-derived "6 steps = 2x bitrate" rule
+# of thumb around CRF 23. SVT-AV1's CRF instead runs a much wider 0-63
+# range centered further out (CRF ~30 is the commonly-cited "default"
+# quality point - see e.g. "SVT-AV1 CRF 30 \u2248 x265 CRF 21 \u2248 x264 CRF 16"),
+# so it gets its own center/step rather than being forced onto x264's.
+CRF_CENTER = {"H.264": 23, "H.265": 23, "AV1": 30}
+CRF_HALVING_STEP = {"H.264": 6, "H.265": 6, "AV1": 9}
 ENCODER_EFFICIENCY = {"CPU": 1.0, "NVIDIA": 1.35, "AMD": 1.35, "Apple": 1.25}
 
 
 def estimate_bitrate_kbps(encoder_label, quality, width, height):
     """Rough estimated output bitrate in kbps for the given encoder combo
     label (an ENCODER_MAP key), CRF/CQ/QP value, and output resolution."""
-    codec = "H.265" if encoder_label.endswith("H.265") else "H.264"
+    if encoder_label.endswith("AV1"):
+        codec = "AV1"
+    elif encoder_label.endswith("H.265"):
+        codec = "H.265"
+    else:
+        codec = "H.264"
     if encoder_label.startswith("CPU"):
         enc_type = "CPU"
     elif encoder_label.startswith("NVIDIA"):
@@ -226,7 +316,7 @@ def estimate_bitrate_kbps(encoder_label, quality, width, height):
     w = width or 1920
     h = height or 1080
     scale = max(1, w * h) / (1920 * 1080)
-    crf_factor = 2 ** ((23 - quality) / 6.0)
+    crf_factor = 2 ** ((CRF_CENTER[codec] - quality) / CRF_HALVING_STEP[codec])
     kbps = (BITRATE_ANCHOR_1080P_H264_CRF23_KBPS * scale * crf_factor
             * CODEC_EFFICIENCY[codec] * ENCODER_EFFICIENCY[enc_type])
     return max(150.0, kbps)
@@ -237,6 +327,15 @@ ENCODER_MAP = {
     "AMD AMF \u00b7 H.264": "h264_amf", "AMD AMF \u00b7 H.265": "hevc_amf",
     "Apple VideoToolbox \u00b7 H.264": "h264_videotoolbox",
     "Apple VideoToolbox \u00b7 H.265": "hevc_videotoolbox",
+    # AV1 is royalty-free (Alliance for Open Media Patent License) so it
+    # carries none of HEVC's patent-pool baggage - no licensing blocker for
+    # an MIT-licensed app. SVT-AV1 (libsvtav1) is BSD-2-Clause + Patent and
+    # already ships in the winget FFmpeg build. No Apple VideoToolbox AV1
+    # entry: as of 2026 VideoToolbox can decode AV1 (M3+) but still has no
+    # AV1 *encoder* - Apple's hardware encoder side remains HEVC-first.
+    "CPU \u00b7 AV1": "libsvtav1",
+    "NVIDIA NVENC \u00b7 AV1": "av1_nvenc",
+    "AMD AMF \u00b7 AV1": "av1_amf",
 }
 BIT_DEPTH_LABELS = ["8-bit (SDR standard)", "10-bit", "12-bit"]
 
@@ -253,6 +352,11 @@ FFMPEG_BIT_DEPTH = {
     "10-bit": ("yuv420p10le", {
         "CPU \u00b7 H.265", "NVIDIA NVENC \u00b7 H.265",
         "AMD AMF \u00b7 H.265", "Apple VideoToolbox \u00b7 H.265",
+        # All three AV1 encoders here handle 10-bit natively (AV1 itself
+        # requires at least the encoder support 8/10-bit; none of these
+        # three builds does AV1 12-bit in practice, so - like H.264 above -
+        # AV1 simply has no 12-bit entry below).
+        "CPU \u00b7 AV1", "NVIDIA NVENC \u00b7 AV1", "AMD AMF \u00b7 AV1",
     }),
     "12-bit": ("yuv420p12le", {"CPU \u00b7 H.265"}),
 }
@@ -296,6 +400,21 @@ HB_ENCODER_IDS = {
     "AMD AMF \u00b7 H.265": {"8-bit (SDR standard)": "vce_h265", "10-bit": "vce_h265_10bit"},
     "Apple VideoToolbox \u00b7 H.264": {"8-bit (SDR standard)": "vt_h264"},
     "Apple VideoToolbox \u00b7 H.265": {"8-bit (SDR standard)": "vt_h265", "10-bit": "vt_h265_10bit"},
+    # AV1 encoder ids added in HandBrake 1.6.0 (svt_av1/svt_av1_10bit, CPU)
+    # and 1.7.0 (nvenc_av1 on RTX 40xx+, vce_av1 on RX 7000+/RDNA3),
+    # confirmed present in `HandBrakeCLI --help` and HandBrake's release
+    # notes. The *_10bit ids for the two hardware ones follow the same
+    # naming convention as nvenc_h265/nvenc_h265_10bit and
+    # vce_h265/vce_h265_10bit above, but - unlike those - aren't directly
+    # confirmed from a HandBrakeCLI build with that exact hardware; if a
+    # given id turns out not to exist on a user's HandBrakeCLI, it's simply
+    # absent from self.hb_encoders and this dict already fails safe the
+    # same way any other detected-but-missing id does (see
+    # _allowed_encoder_labels below): that combo is just not offered,
+    # rather than erroring.
+    "CPU \u00b7 AV1": {"8-bit (SDR standard)": "svt_av1", "10-bit": "svt_av1_10bit"},
+    "NVIDIA NVENC \u00b7 AV1": {"8-bit (SDR standard)": "nvenc_av1", "10-bit": "nvenc_av1_10bit"},
+    "AMD AMF \u00b7 AV1": {"8-bit (SDR standard)": "vce_av1", "10-bit": "vce_av1_10bit"},
 }
 # HandBrakeCLI's --encoder-profile isn't required to get 10/12-bit output -
 # the *_10bit/*_12bit encoder id alone already forces it - but setting it
@@ -303,12 +422,31 @@ HB_ENCODER_IDS = {
 # muxers that check it rather than the actual sample depth.
 HB_PROFILE_FOR_DEPTH = {"10-bit": "main10", "12-bit": "main12"}
 
+# Quality-spin/-slider range per encoder label ("standard"/"pro" pair +
+# a sane default value). Every encoder except CPU AV1 shares the same
+# familiar 0-51 CRF/CQ/QP scale (x264/x265's CRF, and NVENC/AMF's -cq/-qp
+# happen to use that same 0-51 range regardless of codec) - that's why
+# toggle_pro_mode() could hard-code (14,28)/(0,51) before AV1 existed here.
+# SVT-AV1's CRF instead runs 0-63 with a much higher "sane default" (~30
+# vs ~18-23), so CPU AV1 gets its own pair of ranges; every other label
+# (including the new NVIDIA/AMD AV1 hardware encoders) falls back to
+# DEFAULT_QUALITY_RANGE unchanged.
+QUALITY_RANGES = {
+    "CPU \u00b7 AV1": {"standard": (24, 38), "pro": (0, 63), "default": 30},
+}
+DEFAULT_QUALITY_RANGE = {"standard": (14, 28), "pro": (0, 51), "default": 18}
+
 
 # ---- small helpers -----------------------------------------------------
 
 def exe(n):
     names = (n + ".exe", n) if sys.platform.startswith("win") else (n,)
-    return next((str(ROOT / x) for x in names if (ROOT / x).is_file()), shutil.which(n))
+    locations = (ROOT, PORTABLE_TOOLS_DIR)
+    for location in locations:
+        found = next((str(location / x) for x in names if (location / x).is_file()), None)
+        if found:
+            return found
+    return shutil.which(n)
 
 
 def wrappable(path):
@@ -427,6 +565,40 @@ def refresh_windows_path():
         pass
 
 
+def header_icon(kind, color):
+    """Draw small header controls without relying on emoji-font availability."""
+    pixmap = QPixmap(22, 22)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor(color), 1.7)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+
+    if kind == "globe":
+        painter.drawEllipse(3.5, 3.5, 15, 15)
+        painter.drawEllipse(7.2, 3.5, 7.6, 15)
+        painter.drawLine(3.8, 11, 18.2, 11)
+    elif kind == "sun":
+        painter.drawEllipse(7, 7, 8, 8)
+        for x1, y1, x2, y2 in ((11, 2, 11, 4.5), (11, 17.5, 11, 20), (2, 11, 4.5, 11), (17.5, 11, 20, 11),
+                                (4.6, 4.6, 6.4, 6.4), (15.6, 15.6, 17.4, 17.4),
+                                (17.4, 4.6, 15.6, 6.4), (6.4, 15.6, 4.6, 17.4)):
+            painter.drawLine(x1, y1, x2, y2)
+    else:  # moon
+        path = QPainterPath()
+        path.addEllipse(4, 3, 15, 16)
+        cutout = QPainterPath()
+        cutout.addEllipse(9, 2, 15, 16)
+        painter.setBrush(QColor(color))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawPath(path.subtracted(cutout))
+
+    painter.end()
+    return QIcon(pixmap)
+
+
 def find_icon():
     """Look next to the script (or, when frozen, next to the unpacked exe
     contents) for an icon file, so dropping one in with a recognized name
@@ -508,14 +680,15 @@ class Card(QGroupBox):
         super().__init__(title, parent)
         self.setProperty("role", "card")
         self.body = QVBoxLayout(self)
-        self.body.setContentsMargins(16, 20, 16, 16)
-        self.body.setSpacing(8)
+        self.body.setContentsMargins(16, 12, 16, 10)
+        self.body.setSpacing(6)
 
 
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("HDR to SDR Movie Converter")
+        self.i18n = Localizer()
+        self.setWindowTitle(self.tr("HDR to SDR Video Converter"))
         self.setAcceptDrops(True)
 
         self.FONT = pick_font(["Segoe UI", "SF Pro Text", "Inter", "Ubuntu", "Helvetica Neue"], "")
@@ -530,6 +703,7 @@ class MainWindow(QWidget):
         self.src_height = None
         self.has_bt2390 = False
         self.has_st2094 = False
+        self.ffmpeg_version = None
         self.encoders = set()
         self.hb_encoders = set()
         self.proc = None
@@ -543,6 +717,17 @@ class MainWindow(QWidget):
         self._frame_preview_gen = 0
         self._current_preview_pixmap = None
         self._test_clip_proc = None
+        # The preview card shows one status line under the frame, not two:
+        # normal state is the "Preview frame at ..." meta text, but a test
+        # clip render/cancel/failure message takes over that same line
+        # while it's relevant, then hands it back. Two separate labels
+        # used to stack here, which left an awkward double gap once the
+        # test-clip line had something to say.
+        self._preview_meta_text = ""
+        self._test_clip_status_text = ""
+        self.queue_paths = []
+        self.queue_running = False
+        self.output_folder = None
         self._test_clip_out = None
         self._last_analysis_raw = None
         self.side_tab = None
@@ -556,6 +741,7 @@ class MainWindow(QWidget):
         self.theme_name = "light"
 
         self.build()
+        self.retranslate_static_ui()
         self.apply_theme()
         # ---- TEST BUILD: synchronous startup, one-shot sizing --------
         # Every previous fix here (seeding method_combo before check(),
@@ -583,6 +769,53 @@ class MainWindow(QWidget):
         self._fit_height_to_content(width=1080)
         self.update_run_controls()
 
+    def tr(self, source, **values):
+        """Translate an English source string while keeping English as a safe fallback."""
+        return self.i18n.text(source, **values)
+
+    def _translate_widget_property(self, widget, getter, setter, property_name):
+        source = widget.property(property_name)
+        if source is None:
+            source = getter()
+            widget.setProperty(property_name, source)
+        if source:
+            setter(self.tr(source))
+
+    def retranslate_static_ui(self):
+        """Translate visible static captions without altering internal combo-box values."""
+        self.setWindowTitle(self.tr("HDR to SDR Video Converter"))
+        for widget in self.findChildren(QGroupBox):
+            self._translate_widget_property(widget, widget.title, widget.setTitle, "i18n_title")
+        for widget in self.findChildren(QLabel):
+            self._translate_widget_property(widget, widget.text, widget.setText, "i18n_text")
+        for widget in self.findChildren(QPushButton):
+            self._translate_widget_property(widget, widget.text, widget.setText, "i18n_text")
+            self._translate_widget_property(widget, widget.toolTip, widget.setToolTip, "i18n_tooltip")
+        for widget in self.findChildren(QCheckBox):
+            self._translate_widget_property(widget, widget.text, widget.setText, "i18n_text")
+            self._translate_widget_property(widget, widget.toolTip, widget.setToolTip, "i18n_tooltip")
+        self.language_button.setText("")
+        self.theme_btn.setText("")
+        self.theme_btn.setToolTip(
+            self.tr("☀ Light mode") if self.theme_name == "dark" else self.tr("🌙 Dark mode"))
+        self.language_button.setToolTip(self.tr("Interface language"))
+
+    def rebuild_language_menu(self):
+        self.language_menu.clear()
+        saved_language = self.i18n.settings.value("interface_language", "system")
+        choices = [("system", "System default (Windows)"), *LANGUAGE_NAMES.items()]
+        for code, name in choices:
+            action = QAction(name, self.language_menu)
+            action.setCheckable(True)
+            action.setChecked(code == saved_language)
+            action.triggered.connect(lambda checked=False, selected=code: self.change_language(selected))
+            self.language_menu.addAction(action)
+
+    def change_language(self, code):
+        self.i18n.set_language(code)
+        self.rebuild_language_menu()
+        self.retranslate_static_ui()
+
     # ---- theming ---------------------------------------------------
     def apply_theme(self):
         t = THEMES[self.theme_name]
@@ -590,7 +823,7 @@ class MainWindow(QWidget):
         QWidget {{ background: {t['BG']}; color: {t['TXT']}; font-family: '{self.FONT}'; }}
         QGroupBox[role="card"], QFrame[role="card"] {{
             background: {t['CARD']}; border: 1px solid {t['BORDER']}; border-radius: 6px;
-            margin-top: 10px; font-family: '{self.FONT_SEMI}'; font-size: 9pt; font-weight: 600;
+            margin-top: 16px; font-family: '{self.FONT_SEMI}'; font-size: 9pt; font-weight: 600;
         }}
         QGroupBox[role="card"]::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px; color: {t['TXT']}; }}
         QLabel {{ background: transparent; }}
@@ -619,7 +852,10 @@ class MainWindow(QWidget):
         QPushButton[role="pause-ready"]:hover {{ background: {t['AMBER2']}; }}
         QPushButton[role="resume-ready"] {{ background: {t['GREEN']}; color: white; border: none; }}
         QPushButton[role="resume-ready"]:hover {{ background: {t['GREEN2']}; }}
-        QPushButton[role="theme"] {{ background: {t['CARD']}; border: 1px solid {t['BORDER']}; }}
+        QPushButton[role="theme"], QToolButton[role="theme"] {{
+            background: {t['CARD']}; border: 1px solid {t['BORDER']}; border-radius: 4px; padding: 7px 10px;
+        }}
+        QToolButton[role="theme"]::menu-indicator {{ image: none; width: 0px; }}
         QPushButton[role="kofi"] {{ background: #FF5E5B; color: white; border: none; font-weight: 600; }}
         QPushButton[role="kofi"]:hover {{ background: #F04642; }}
         QPushButton[role="toggle"] {{
@@ -673,7 +909,8 @@ class MainWindow(QWidget):
         QSlider::groove:horizontal {{ height: 4px; background: {t['FIELD']}; border: 1px solid {t['BORDER']}; border-radius: 2px; }}
         QSlider::handle:horizontal {{ width: 14px; margin: -6px 0; background: {t['INDIGO']}; border-radius: 7px; }}
         QProgressBar {{
-            background: {t['DISABLED']}; border: none; border-radius: 5px; height: 10px; text-align: center; color: transparent;
+            background: {t['DISABLED']}; border: none; border-radius: 5px;
+            min-height: 10px; max-height: 10px; text-align: center; color: transparent;
         }}
         QProgressBar::chunk {{ background: {t['INDIGO']}; border-radius: 5px; }}
         QProgressBar[state="warn"]::chunk {{ background: {t['AMBER']}; }}
@@ -699,7 +936,18 @@ class MainWindow(QWidget):
         # means minimumSizeHint() below already reflects the final, padded
         # sizes rather than a stale pre-polish guess.
         QApplication.processEvents()
-        self.theme_btn.setText("\u2600 Light mode" if self.theme_name == "dark" else "\U0001F319 Dark mode")
+        self.language_button.setIcon(header_icon("globe", t["TXT"]))
+        self.theme_btn.setIcon(header_icon("sun" if self.theme_name == "dark" else "moon", t["TXT"]))
+        self.language_button.setText("")
+        self.theme_btn.setText("")
+        self.theme_btn.setToolTip(
+            self.tr("☀ Light mode") if self.theme_name == "dark" else self.tr("🌙 Dark mode"))
+        # Sized here (not at widget-creation time) because the "muted"
+        # role's real 9pt font only exists after the stylesheet above is
+        # applied and polished - reading fontMetrics() any earlier sees the
+        # window's pre-stylesheet default font and reserves noticeably more
+        # height than the text actually needs once themed.
+
 
     def toggle_theme(self):
         self.theme_name = "dark" if self.theme_name == "light" else "light"
@@ -708,13 +956,13 @@ class MainWindow(QWidget):
     # ---- build -------------------------------------------------------
     def build(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(20, 16, 20, 16)
-        root.setSpacing(10)
+        root.setContentsMargins(20, 14, 20, 10)
+        root.setSpacing(6)
 
         # header
         header = QHBoxLayout()
         htitle = QVBoxLayout()
-        title = QLabel("HDR to SDR Movie Converter")
+        title = QLabel("HDR to SDR Video Converter")
         set_role(title, "title")
         htitle.addWidget(title)
         header.addLayout(htitle)
@@ -726,7 +974,21 @@ class MainWindow(QWidget):
         self.kofi_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(KOFI_URL)))
         header.addWidget(self.kofi_btn, 0, Qt.AlignmentFlag.AlignTop)
 
-        self.theme_btn = QPushButton("\U0001F319 Dark mode")
+        self.language_button = QToolButton()
+        self.language_button.setText("")
+        self.language_button.setToolTip("Interface language")
+        self.language_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.language_menu = QMenu(self.language_button)
+        self.language_button.setMenu(self.language_menu)
+        self.rebuild_language_menu()
+        self.language_button.setFixedSize(38, 34)
+        set_role(self.language_button, "theme")
+        header.addWidget(self.language_button, 0, Qt.AlignmentFlag.AlignTop)
+
+        self.theme_btn = QToolButton()
+        self.theme_btn.setText("")
+        self.theme_btn.setToolTip("🌙 Dark mode")
+        self.theme_btn.setFixedSize(38, 34)
         set_role(self.theme_btn, "theme")
         self.theme_btn.clicked.connect(self.toggle_theme)
         header.addWidget(self.theme_btn, 0, Qt.AlignmentFlag.AlignTop)
@@ -743,6 +1005,8 @@ class MainWindow(QWidget):
         right = QVBoxLayout(right_panel)
         left.setContentsMargins(0, 0, 0, 0)
         right.setContentsMargins(0, 0, 0, 0)
+        left.setSpacing(8)
+        right.setSpacing(8)
         self.splitter.addWidget(left_panel)
         self.splitter.addWidget(right_panel)
         self.splitter.setStretchFactor(0, 2)
@@ -750,39 +1014,135 @@ class MainWindow(QWidget):
 
         # ---- FILES ----
         self.files_card = files = Card("FILES")
-        grid = QGridLayout()
-        grid.setColumnStretch(1, 1)
+        # Without this, Qt's box layout lets this card float up toward its
+        # *preferred* size (the queue list can grow from 64px to its 90px
+        # cap) before the cards below it even get their guaranteed minimum
+        # - that stolen space is exactly what was landing as the LIVE
+        # PREVIEW button row overlapping the image. Minimum vertical policy
+        # means this card only ever claims its own true minimum; any real
+        # leftover space still flows to CONTROLS (stretch=1) as before.
+        files.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        # Source/output line edits remain as internal state used by the
+        # encoder. The visible workflow is intentionally queue-first.
         self.src_edit = QLineEdit()
         self.dst_edit = QLineEdit()
-        for r, (label, edit, fn) in enumerate((
-                ("Source", self.src_edit, self.browse_source),
-                ("SDR output", self.dst_edit, self.browse_output))):
-            grid.addWidget(QLabel(label), r, 0)
-            grid.addWidget(edit, r, 1)
-            btn = QPushButton("Browse")
-            btn.clicked.connect(fn)
-            grid.addWidget(btn, r, 2)
-        files.body.addLayout(grid)
+
+        self.queue_list = QListWidget()
+        # Kept small on purpose: this list scrolls internally once it has
+        # more entries than fit, so a tall minimum height here only ever
+        # buys "see more rows without scrolling" at the cost of pushing
+        # every card below FILES further down the window - which is the
+        # opposite of what we want when vertical space is tight.
+        self.queue_list.setMinimumHeight(64)
+        self.queue_list.setMaximumHeight(90)
+        # The list's own height is capped above, so once more items are
+        # queued than fit in that fixed viewport, they must scroll rather
+        # than pushing the card taller. QAbstractItemView already defaults
+        # to an as-needed vertical scrollbar, but that default is set
+        # explicitly here so it doesn't silently depend on it.
+        self.queue_list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.queue_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.queue_list.setToolTip("Videos waiting to be converted with the current settings.")
+        files.body.addWidget(self.queue_list)
+
+        # "Drop video files here..." used to be its own QLabel sitting
+        # above the queue list, permanently costing a row of vertical
+        # space whether the queue was empty or full. It only actually
+        # means something while the queue *is* empty, so instead it's a
+        # transparent overlay painted directly on top of the (then-empty)
+        # list viewport - free real estate that costs nothing once real
+        # queue rows exist. WA_TransparentForMouseEvents lets clicks/drags
+        # pass straight through to the list/window underneath instead of
+        # being swallowed by the label.
+        self.queue_hint_label = QLabel("Drop video files here, or add them to the conversion queue.", self.queue_list.viewport())
+        self.queue_hint_label.setWordWrap(True)
+        self.queue_hint_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        set_role(self.queue_hint_label, "muted")
+        self.queue_hint_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.queue_list.viewport().installEventFilter(self)
+        # QListWidget's model emits these on every addItem()/takeItem(),
+        # covering every current and future call site in one place rather
+        # than needing an explicit _update_queue_hint() call added at each
+        # of them.
+        self.queue_list.model().rowsInserted.connect(self._update_queue_hint)
+        self.queue_list.model().rowsRemoved.connect(self._update_queue_hint)
+        self._update_queue_hint()
+        queue_row = QHBoxLayout()
+        self.queue_add_btn = QPushButton("Add videos")
+        self.queue_remove_btn = QPushButton("Remove")
+        self.queue_start_btn = QPushButton("Start queue")
+        self.output_folder_btn = QPushButton("SDR output")
+        self.queue_add_btn.clicked.connect(self.browse_source)
+        self.queue_remove_btn.clicked.connect(self._remove_queue_item)
+        self.queue_start_btn.clicked.connect(self.start_queue)
+        self.output_folder_btn.clicked.connect(self.browse_output)
+        self.output_folder_btn.setToolTip("Choose one output folder for all queued files. Default: next to each source video.")
+        for button in (self.queue_add_btn, self.queue_remove_btn, self.queue_start_btn, self.output_folder_btn):
+            set_role(button, "panel-toggle")
+            queue_row.addWidget(button)
+        files.body.addLayout(queue_row)
         left.addWidget(files)
 
         # ---- SOURCE ANALYSIS ----
         analysis = Card("SOURCE ANALYSIS")
+        # Same reasoning as FILES above.
+        analysis.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         self.analysis_label = QLabel("Select a video to analyze it automatically.")
         self.analysis_label.setWordWrap(True)
         # Left+Top, not the QLabel default of Left+VCenter - vertical
         # centering was making any gap between the actual text height and a
         # reserved minimum height look like blank padding above *and* below.
         self.analysis_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        # Deliberately no fixed setMinimumHeight() here (there used to be
-        # one, guessed in pixels): actual line height depends on the
-        # system's font/DPI, and a bigger-than-needed guess is exactly what
-        # kept leaving a large dead area under the text - guessing again
-        # would just as likely reproduce it on a different setup. The card
-        # doing a small one-time resize once analyze() fills this in is a
-        # smaller cost than a persistent block of empty space for the rest
-        # of the session.
         set_role(self.analysis_label, "muted")
-        analysis.body.addWidget(self.analysis_label)
+        # Pinned to a fixed height via a QScrollArea rather than left to
+        # size itself off the label's own sizeHint(). analyze() swaps this
+        # label's text between a 1-line placeholder and a variable-length
+        # HTML block (headline + source line + 3 recommendation lines +
+        # an optional primaries warning, 5-7 lines depending on the
+        # source) - letting that reflow the card's height used to change
+        # self.minimumSizeHint() for the whole window on every Analyze
+        # click. Because QSplitter always forces the left and right
+        # columns to the same height, that change didn't just resize
+        # SOURCE ANALYSIS - it changed how much filler space landed in
+        # CONVERSION's own addStretch(1) too (see the comment there),
+        # which is what made that empty area grow/shrink on every click.
+        # Fixing the height here removes that variable at the source: the
+        # left column's total height is now constant regardless of what
+        # Analyze produces, and the rare case that doesn't fit the
+        # reserved height scrolls internally instead of resizing anything.
+        self.analysis_scroll = QScrollArea()
+        self.analysis_scroll.setWidgetResizable(True)
+        # Height comes from real font metrics for the 9pt "muted" role QSS
+        # sets on this label (see `QLabel[role="muted"]` below), not a
+        # guessed constant. analyze() fills this label with up to 7 lines
+        # in the common case - headline, "Source file", the source-details
+        # line, "Recommended settings", and the three preset lines - so
+        # that's what's reserved here. The rare 8th line (a primaries
+        # mismatch warning) or an unusually long source-details line that
+        # wraps isn't worth reserving space for on every single analysis;
+        # it just scrolls instead, via the QScrollArea already wrapping
+        # this label.
+        analysis_fm = QFontMetrics(QFont(self.FONT, 9))
+        analysis_visible_lines = 7
+        self.analysis_scroll.setFixedHeight(analysis_fm.lineSpacing() * analysis_visible_lines + 8)
+        self.analysis_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.analysis_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.analysis_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        # Transparent so the scroll area/viewport don't paint a second,
+        # slightly-different background on top of the card's own - without
+        # this it reads as a nested box rather than part of the card.
+        self.analysis_scroll.setStyleSheet("background: transparent; border: none;")
+        self.analysis_scroll.viewport().setStyleSheet("background: transparent;")
+        self.analysis_scroll.setWidget(self.analysis_label)
+        analysis.body.addWidget(self.analysis_scroll)
+
+
+
+        self.analyze_btn = QPushButton("Analyze selected video")
+        set_role(self.analyze_btn, "panel-toggle")
+        self.analyze_btn.setToolTip("Analyze the selected queue item before converting it.")
+        self.analyze_btn.clicked.connect(self.analyze_selected_queue_video)
+        analysis.body.addWidget(self.analyze_btn)
 
         # One-click "just do it" versions of the three lines above: apply
         # that tier's tone-mapping curve/encoder/quality settings without
@@ -806,7 +1166,6 @@ class MainWindow(QWidget):
             b.setToolTip(tip)
             b.clicked.connect(fn)
             preset_row.addWidget(b)
-        analysis.body.addLayout(preset_row)
         left.addWidget(analysis)
 
 
@@ -818,33 +1177,47 @@ class MainWindow(QWidget):
         # tone-mapped/encoded output (ffmpeg splits the stream into the
         # encode + preview branches - see command_ffmpeg) takes over.
         preview = Card("LIVE PREVIEW")
+        # The card needs room for the fixed viewport, caption and the action
+        # row. A hand-typed setMinimumHeight() here previously understated
+        # the real content height (fixed 220px viewport + caption + button
+        # row + status line + margins comes to well over 330px), and since
+        # an explicit minimumHeight overrides the layout's own computed
+        # minimum for how much space the *parent* layout gives this card,
+        # that mismatch is exactly what let the button row get squeezed on
+        # top of the preview image. Preferred/Minimum lets Qt compute the
+        # real minimum from the children instead, and Minimum (no shrink
+        # flag) stops the parent VBox from compressing it below that even
+        # when the window is short.
+        preview.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         self.preview_label = QLabel("Choose a source video to see an instant preview of the current settings.")
         self.preview_label.setWordWrap(True)
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_label.setMinimumHeight(180)
+        # A fixed viewport makes the layout reserve space for the image,
+        # metadata and action row separately. Without it QLabel's pixmap
+        # size can arrive after the card's first geometry pass and visually
+        # meet the buttons at the bottom edge.
+        self.preview_label.setFixedHeight(220)
         set_role(self.preview_label, "muted")
         self.preview_label.installEventFilter(self)
         preview.body.addWidget(self.preview_label)
         self.preview_meta_label = QLabel("")
+        self.preview_meta_label.setWordWrap(True)
         self.preview_meta_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         set_role(self.preview_meta_label, "muted")
         preview.body.addWidget(self.preview_meta_label)
 
-        # All preview-related actions live in one row of same-size icon
-        # buttons rather than two rows of differently sized text buttons -
-        # each one's tooltip carries the full description (same pattern as
-        # the tone-mapping dropdown), so nothing needs a permanent text
-        # label competing for space. Readiness of the test clip is shown by
-        # the "open" button turning green rather than by a status sentence.
+        # Keep actions under the frame. Overlay controls hide the details
+        # that the preview is meant to show.
         btn_row = QHBoxLayout()
-        self.preview_expand_btn = QPushButton("\u26f6")
-        set_role(self.preview_expand_btn, "icon-btn")
+        btn_row.setContentsMargins(0, 4, 0, 0)
+        self.preview_expand_btn = QPushButton("View full size")
+        set_role(self.preview_expand_btn, "panel-toggle")
         self.preview_expand_btn.setEnabled(False)
         self.preview_expand_btn.setToolTip("View full size \u2014 open the current preview frame in a larger window.")
         self.preview_expand_btn.clicked.connect(self.show_preview_fullscreen)
 
-        self.preview_save_btn = QPushButton("\u2913")
-        set_role(self.preview_save_btn, "icon-btn")
+        self.preview_save_btn = QPushButton("Save frame")
+        set_role(self.preview_save_btn, "panel-toggle")
         self.preview_save_btn.setEnabled(False)
         self.preview_save_btn.setToolTip("Save frame \u2014 save the current preview frame to disk as an image.")
         self.preview_save_btn.clicked.connect(self.save_preview_frame)
@@ -859,45 +1232,36 @@ class MainWindow(QWidget):
         # instead, offer a cheap one-off: encode a short real clip with
         # today's settings through the actual backend that will be used,
         # and let the person play it back with their own player.
-        self.test_clip_btn = QPushButton("\u25b6")
-        set_role(self.test_clip_btn, "icon-btn")
+        self.test_clip_btn = QPushButton("Render 5s test")
+        set_role(self.test_clip_btn, "panel-toggle")
         self.test_clip_btn.setToolTip(
             "Render 5s test clip \u2014 encode a short real clip from the middle of the "
             "source with the current settings, through the backend that will be used "
             "for the full conversion, so you can check quality and motion first.")
         self.test_clip_btn.clicked.connect(self._run_test_clip)
 
-        self.test_clip_open_btn = QPushButton("\u2197")
-        set_role(self.test_clip_open_btn, "icon-btn")
+        self.test_clip_open_btn = QPushButton("Open test clip")
+        set_role(self.test_clip_open_btn, "panel-toggle")
         self.test_clip_open_btn.setEnabled(False)
         self.test_clip_open_btn.setToolTip(
             "Open test clip \u2014 no test clip rendered yet. Turns green once one is ready to play.")
         self.test_clip_open_btn.clicked.connect(self._open_test_clip)
 
-        btn_row.addStretch(1)
         for b in (self.preview_expand_btn, self.preview_save_btn, self.test_clip_btn, self.test_clip_open_btn):
-            b.setFixedSize(34, 34)
             btn_row.addWidget(b)
-        btn_row.addStretch(1)
         preview.body.addLayout(btn_row)
-
-        # Short-lived only: rendering progress and failures. Cleared again
-        # once idle or on success, since success is shown by the "open"
-        # button's colour instead.
-        self.test_clip_status = QLabel("")
-        self.test_clip_status.setWordWrap(True)
-        self.test_clip_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        set_role(self.test_clip_status, "muted")
-        self.test_clip_status.setVisible(False)
-        preview.body.addWidget(self.test_clip_status)
 
         left.addWidget(preview)
 
         # ---- PROGRESS ----
         progress = Card("PROGRESS")
+        # Same reasoning as LIVE PREVIEW above: don't let this card be
+        # compressed below its real content height.
+        progress.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         self.pbar = QProgressBar()
         self.pbar.setRange(0, 1000)  # 0.1% resolution
         self.status_label = QLabel("")
+        self.status_label.setWordWrap(False)
         set_role(self.status_label, "muted")
         self.speed_label = QLabel("")
         self.speed_label.setWordWrap(True)
@@ -911,19 +1275,29 @@ class MainWindow(QWidget):
         set_role(self.resource_label, "muted")
         if not self.resource_label.text():
             self.resource_label.hide()
-        progress.body.addWidget(self.pbar)
-        progress.body.addWidget(self.status_label)
+        # The bar and its status text ("Ready", "Converting... 42%", "Done -
+        # saved to output"...) used to be stacked on separate lines, costing
+        # a full extra row for what's essentially a short caption. Putting
+        # them side by side instead - bar stretching to fill the row, text
+        # right after it - keeps the same information in half the height,
+        # without the contrast headaches of actually painting text on top
+        # of the (colour-coded, quite thin) bar itself.
+        pbar_row = QHBoxLayout()
+        pbar_row.setSpacing(10)
+        pbar_row.addWidget(self.pbar, 1)
+        pbar_row.addWidget(self.status_label)
+        progress.body.addLayout(pbar_row)
         progress.body.addWidget(self.speed_label)
         progress.body.addWidget(self.resource_label)
         left.addWidget(progress)
 
         # ---- CONTROLS ----
-        controls = Card("CONTROLS")
+        self.controls_card = controls = Card("CONTROLS")
 
         run_row = QHBoxLayout()
         self.go_btn = QPushButton("Start")
         set_role(self.go_btn, "go")
-        self.go_btn.clicked.connect(self.start)
+        self.go_btn.clicked.connect(self.start_queue)
         self.pause_btn = QPushButton("Pause")
         self.pause_btn.clicked.connect(self.toggle_pause)
         self.stop_btn = QPushButton("Stop")
@@ -978,8 +1352,32 @@ class MainWindow(QWidget):
         note.setWordWrap(True)
         set_role(note, "muted")
         controls.body.addWidget(note)
-        controls.body.addStretch(1)
-        left.addWidget(controls, 1)
+        # CONTROLS is fixed-height now: no addStretch(1) inside its body,
+        # and no stretch factor on the addWidget() call below. Between
+        # this, SOURCE ANALYSIS being pinned via a QScrollArea (see
+        # analysis_scroll above) and LIVE PREVIEW's own setFixedHeight,
+        # every card in the left column now sizes itself off its real
+        # content only - the left column's total height is therefore
+        # constant, not something that grows to soak up whatever QSplitter
+        # forces onto it. CONVERSION (see conv.body.addStretch(1) further
+        # down) is the one card left with a stretch, and is the one
+        # expected to flex to match the left column - not the other way
+        # round. See left.addStretch(1) below for the (rare-case) fallback
+        # if that assumption is ever wrong.
+        left.addWidget(controls)
+        # Fallback only, not the everyday case: with FILES/SOURCE
+        # ANALYSIS/LIVE PREVIEW/PROGRESS/CONTROLS all fixed-height, the
+        # left column's minimum is normally already >= CONVERSION's, so
+        # this stretch has nothing to do - CONVERSION's own
+        # addStretch(1) is what actually absorbs the gap between the two
+        # columns in that ordinary case. This exists for the opposite,
+        # unusual case: if CONVERSION's natural minimum ever grows past
+        # the left column's fixed total (e.g. a future addition of more
+        # controls there), QSplitter forces the left column taller too -
+        # without a stretch to claim that extra space, it would have to
+        # come from inside one of the fixed cards above instead of
+        # showing up here, as plain background below CONTROLS.
+        left.addStretch(1)
 
         # ---- CONVERSION ----
         self.conv_card = conv = Card("CONVERSION")
@@ -988,6 +1386,14 @@ class MainWindow(QWidget):
         self.backend_combo.addItems(["FFmpeg", "HandBrake"])
         loosen_combo(self.backend_combo, 14)
         conv.body.addWidget(self.backend_combo)
+
+        conv.body.addLayout(preset_row)
+
+        self.ffmpeg_version_note = QLabel("")
+        self.ffmpeg_version_note.setWordWrap(True)
+        set_role(self.ffmpeg_version_note, "warn")
+        self.ffmpeg_version_note.hide()
+        conv.body.addWidget(self.ffmpeg_version_note)
 
         conv.body.addWidget(QLabel("Tone mapping"))
         self.method_combo = QComboBox()
@@ -1016,6 +1422,12 @@ class MainWindow(QWidget):
         self.backend_combo.currentTextChanged.connect(
             lambda _text: self._on_bit_depth_changed(self.bit_depth_combo.currentText()))
         self._on_bit_depth_changed(self.bit_depth_combo.currentText())
+        # _on_bit_depth_changed() repopulates encoder_combo with
+        # blockSignals(True) (see there), so a switch into/out of CPU AV1
+        # triggered purely by a bit-depth change wouldn't otherwise reach
+        # currentTextChanged - hook it directly instead of relying on that
+        # signal for this one thing.
+        self.encoder_combo.currentTextChanged.connect(lambda _t: self._update_quality_range())
 
         self.pro_mode_chk = QCheckBox("Pro mode")
         self.pro_mode_chk.toggled.connect(self.toggle_pro_mode)
@@ -1095,58 +1507,48 @@ class MainWindow(QWidget):
         res_note.setWordWrap(True)
         set_role(res_note, "muted")
         conv.body.addWidget(res_note)
+
+        # Stretch goes here, between the settings fields and the two
+        # bottom buttons, instead of after the buttons - that way the
+        # buttons are pinned to the bottom edge of the CONVERSION card.
+        # See the matching comment on controls.body.addStretch(1) /
+        # left.addWidget(controls, 1) above: since QSplitter always forces
+        # both columns to the same height regardless of content, the
+        # leftover height has to go somewhere - putting it here, inside
+        # the card, keeps it looking intentional (Activity/Install sit at
+        # the bottom) instead of showing up as bare background below the
+        # card.
         conv.body.addStretch(1)
+
+        # Activity now lives right above the dependency button instead of
+        # in PROGRESS - it's used far more often when something's going
+        # wrong with a dependency/setup step than during normal encoding,
+        # so it reads better as a neighbour of "Install missing
+        # dependencies" than of the progress bar.
+        self.activity_btn = QPushButton("Activity")
+        self.activity_btn.setCheckable(True)
+        set_role(self.activity_btn, "panel-toggle")
+        self.activity_btn.clicked.connect(self.toggle_activity)
+        conv.body.addWidget(self.activity_btn)
+
+        # "Install missing dependencies" and "Update FFmpeg" used to be two
+        # separate buttons. Both are Windows-only (winget / a PowerShell
+        # portable-download script), so they're merged into the single
+        # button Windows actually needs: install whatever's missing, or -
+        # if FFmpeg and HandBrakeCLI are both already present - offer to
+        # update FFmpeg instead of just saying "nothing to do".
+        if sys.platform.startswith("win"):
+            self.install_btn = QPushButton("Install missing dependencies")
+            set_role(self.install_btn, "panel-toggle")
+            self.install_btn.setToolTip(
+                "Installs FFmpeg/HandBrakeCLI if either is missing. If both are "
+                "already installed, offers to update FFmpeg instead.")
+            self.install_btn.clicked.connect(self.install_or_update_dependencies)
+            conv.body.addWidget(self.install_btn)
 
         right.addWidget(conv, 1)
 
-        # ---- SYSTEM ----
-        # Own card now (was previously a toolbar strip tacked onto the
-        # bottom of CONVERSION) so it reads as its own section, same as
-        # FILES/SOURCE ANALYSIS/PROGRESS/CONTROLS, instead of looking like
-        # part of the conversion settings above it.
-        self.activity_card = activity_card = Card("SYSTEM")
-        panel_row = QHBoxLayout()
-        panel_row.setContentsMargins(0, 0, 0, 0)
-        panel_row.setSpacing(8)
-        self.activity_tab_btn = QPushButton("Activity")
-        self.activity_tab_btn.setCheckable(True)
-        set_role(self.activity_tab_btn, "panel-toggle")
-        self.activity_tab_btn.clicked.connect(self.toggle_activity)
-        self.caps_tab_btn = QPushButton("System")
-        self.caps_tab_btn.setCheckable(True)
-        set_role(self.caps_tab_btn, "panel-toggle")
-        self.caps_tab_btn.clicked.connect(self.toggle_caps)
-        panel_row.addStretch(1)
-        panel_row.addWidget(self.activity_tab_btn)
-        panel_row.addStretch(1)
-        panel_row.addWidget(self.caps_tab_btn)
-        panel_row.addStretch(1)
-        if sys.platform.startswith("win"):
-            # A shortcut straight to the winget install this app can already
-            # do - previously that button only existed inside the System
-            # panel's Capabilities page, a click and a scroll away. This
-            # calls the exact same start_dependency_setup() (which already
-            # handles "nothing to install", missing winget, and switching
-            # to Activity to show progress on its own), just reachable
-            # without opening a panel first.
-            self.quick_install_btn = QPushButton("Quick install")
-            set_role(self.quick_install_btn, "panel-toggle")
-            self.quick_install_btn.setToolTip("Install FFmpeg/HandBrakeCLI automatically via winget")
-            self.quick_install_btn.clicked.connect(self.start_dependency_setup)
-            panel_row.addWidget(self.quick_install_btn)
-            panel_row.addStretch(1)
-        activity_card.body.addLayout(panel_row)
-        right.addWidget(activity_card)
-
-        # ---- Activity / Capabilities: one panel docked below the
-        # splitter, opened from the two toggle buttons above ----
-        # Third layout for this feature. The buttons themselves have moved
-        # a couple of times now (side rail, a row inside CONVERSION, now
-        # their own SYSTEM card) - but the panel they open stays
-        # exactly where the previous version put it: a plain widget docked
-        # below the splitter, which shrinks to give it height rather than
-        # the window growing sideways or the buttons needing to live next
-        # to it.
+        # ---- ACTIVITY: a collapsed log drawer below the splitter --------
         self.side_panel = QWidget()
         self.side_panel.setMinimumHeight(160)
         self.side_panel.setMaximumHeight(260)
@@ -1156,8 +1558,6 @@ class MainWindow(QWidget):
         self.side_card = QFrame()
         self.side_card.setProperty("role", "card")
         card_layout = QVBoxLayout(self.side_card)
-        self.side_stack = QStackedWidget()
-        card_layout.addWidget(self.side_stack)
         side.addWidget(self.side_card, 1)
         root.addWidget(self.side_panel)
         self.side_panel.hide()
@@ -1169,41 +1569,7 @@ class MainWindow(QWidget):
         self.log.setReadOnly(True)
         set_role(self.log, "log")
         ap_layout.addWidget(self.log)
-        self.side_stack.addWidget(activity_page)  # index 0
-
-        caps_content = QWidget()
-        cp_layout = QVBoxLayout(caps_content)
-        cp_layout.setContentsMargins(0, 0, 0, 0)
-        self.caps_label = QLabel("")
-        set_role(self.caps_label, "mono")
-        self.caps_label.setWordWrap(True)
-        cp_layout.addWidget(self.caps_label)
-        if sys.platform.startswith("win"):
-            setup_row = QHBoxLayout()
-            self.setup_btn = QPushButton("Install missing (winget)")
-            set_role(self.setup_btn, "panel-toggle")
-            self.setup_btn.clicked.connect(self.start_dependency_setup)
-            setup_row.addWidget(self.setup_btn)
-            setup_row.addStretch(1)
-            cp_layout.addLayout(setup_row)
-            setup_note = QLabel("Installs FFmpeg and/or HandBrakeCLI via winget if missing. Progress "
-                                 "streams into Activity. Windows may show a permission (UAC) prompt "
-                                 "during install \u2014 that's normal.")
-            setup_note.setWordWrap(True)
-            set_role(setup_note, "muted")
-            cp_layout.addWidget(setup_note)
-        cp_layout.addStretch(1)
-
-        caps_page = QScrollArea()
-        caps_page.setWidget(caps_content)
-        # setWidgetResizable(True) is what makes this actually work: without
-        # it the scroll area leaves caps_content at its sizeHint width, so
-        # the QLabel word-wraps against that instead of the panel's real
-        # (narrower) width, and text overflows sideways instead of just
-        # scrolling vertically like it should.
-        caps_page.setWidgetResizable(True)
-        caps_page.setFrameShape(QFrame.Shape.NoFrame)
-        self.side_stack.addWidget(caps_page)  # index 1
+        card_layout.addWidget(activity_page)
 
         # ---- bitrate estimate: keep it live as the relevant settings change --
         self.quality_spin.valueChanged.connect(self.update_bitrate_estimate)
@@ -1240,15 +1606,41 @@ class MainWindow(QWidget):
         a flat +24 fudge factor: that reconstruction routinely overshoots
         the real minimum by 20-40px, and every one of those extra pixels
         lands as visible dead space at the bottom of the CONTROLS/
-        CONVERSION cards (both end in addStretch(1), so any slack the
-        splitter is given flows straight into them). self.minimumSizeHint()
-        is exactly the same bottom-up computation Qt already does for us,
-        with no need to re-add a margin on top of it.
+        CONVERSION cards (both end in addStretch(1) and both columns give
+        them stretch factor 1, so any slack the splitter is given flows
+        into these two cards and keeps their bottom edges level with each
+        other - QSplitter forces both columns to the same height
+        regardless of content either way; the stretch just decides
+        whether that shared height shows up as growth inside the cards or
+        as bare background below them). self.minimumSizeHint() is exactly
+        the same bottom-up computation Qt already does for us, with no
+        need to re-add a margin on top of it.
         """
         self._invalidate_all_layouts()
         self.layout().activate()
-        self.resize(width if width is not None else self.width(),
-                    max(560, self.minimumSizeHint().height()))
+        target_h = max(560, self.minimumSizeHint().height())
+        # Never resize past the visible desktop: without this cap, a
+        # tall minimum height (e.g. from SOURCE ANALYSIS's multi-line
+        # summary right after Analyze) can push the window's bottom edge
+        # below the screen, which reads as "the buttons disappeared" even
+        # though they're still in the layout. Leave a little headroom for
+        # the OS taskbar/dock rather than using the full screen height.
+        screen = self.screen() if hasattr(self, "screen") else None
+        if screen is not None:
+            avail_h = screen.availableGeometry().height()
+            target_h = min(target_h, max(480, avail_h - 40))
+        self.resize(width if width is not None else self.width(), target_h)
+        # Also cap how tall the window can be dragged: CONTROLS and
+        # CONVERSION both use stretch=1 to keep their bottom edges level
+        # (see the addWidget(..., 1) comments), which means any extra
+        # height beyond what the content needs doesn't go anywhere useful
+        # - it just piles up as dead space under the CPU-cores note and
+        # above the Activity/Install buttons. Since target_h above is
+        # already the tightest height the layout needs right now, simply
+        # not allowing the window past that (plus a little slack so it
+        # doesn't feel clamped) removes the dead space at the source
+        # instead of trying to absorb it after the fact.
+        self.setMaximumHeight(target_h + 12)
 
     def _invalidate_all_layouts(self):
         """self.layout().activate() alone only recomputes the top-level
@@ -1302,15 +1694,27 @@ class MainWindow(QWidget):
         self.bitrate_label.setText(text)
 
     # ---- pro mode --------------------------------------------------
+    def _update_quality_range(self):
+        """Applies the (standard, pro) range for whichever encoder is
+        currently selected - see QUALITY_RANGES above. Called both on Pro
+        mode toggle and on any encoder change, since CPU AV1 needs a
+        different CRF range than everything else regardless of which of
+        those two changed."""
+        ranges = QUALITY_RANGES.get(self.encoder_combo.currentText(), DEFAULT_QUALITY_RANGE)
+        lo, hi = ranges["pro"] if self.pro_mode_chk.isChecked() else ranges["standard"]
+        # Read the value before touching the range: QSpinBox/QSlider clamp
+        # their current value into the new range as a side effect of
+        # setRange() itself, so checking "is it still in range" afterwards
+        # would always say yes (it was just forced into range) and this
+        # would never fall through to the real default below.
+        old_value = self.quality_spin.value()
+        self.quality_spin.setRange(lo, hi)
+        self.quality_slider.setRange(lo, hi)
+        if not (lo <= old_value <= hi):
+            self.quality_spin.setValue(ranges["default"])
+
     def toggle_pro_mode(self, checked):
-        if checked:
-            self.quality_spin.setRange(0, 51)
-            self.quality_slider.setRange(0, 51)
-        else:
-            self.quality_spin.setRange(14, 28)
-            self.quality_slider.setRange(14, 28)
-            if not (14 <= self.quality_spin.value() <= 28):
-                self.quality_spin.setValue(18)
+        self._update_quality_range()
         self._update_brightness_availability()
         self.refresh_method_choices()
         self.update_bitrate_estimate()
@@ -1355,47 +1759,16 @@ class MainWindow(QWidget):
 
     # ---- collapse toggles -----------------------------------------
     def toggle_activity(self):
-        self._select_tab("activity")
-
-    def toggle_caps(self):
-        self._select_tab("caps")
-
-    def _select_tab(self, tab):
-        # Freeze before check() runs, not just before the layout update:
-        # check() updates several labels outside the Capabilities panel
-        # itself (the status label), and each of those setText() calls
-        # reflows the always-visible Conversion card while repaints are
-        # still enabled - that's what caused the window to visibly creep
-        # in a couple of small steps otherwise.
+        # Freeze the whole layout while changing visibility and height. This
+        # prevents Qt from painting intermediate geometry during the resize.
         self.setUpdatesEnabled(False)
-        if self.side_tab == tab:
-            # Clicking the already-active tab closes the panel - still a
-            # toggle, just a shared one (one panel, two tabs) rather than
-            # two independent ones.
+        if self.side_tab == "activity":
             self.side_tab = None
             self.side_panel.hide()
         else:
-            if tab == "caps":
-                self.check()
-                self.caps_label.setText(self.caps_summary)
-            self.side_tab = tab
-            self.side_stack.setCurrentIndex(0 if tab == "activity" else 1)
+            self.side_tab = "activity"
             self.side_panel.show()
-        self.activity_tab_btn.setChecked(self.side_tab == "activity")
-        self.caps_tab_btn.setChecked(self.side_tab == "caps")
-        # layout().activate() alone grows a top-level window when its new
-        # minimum height is *larger* than the current size - that's what
-        # made opening the panel work with no explicit resize call at all.
-        # It does the opposite of nothing when the new minimum is
-        # *smaller*, though: there's no symmetric auto-shrink, so after
-        # side_panel.hide() the window just stayed at its already-grown
-        # size, leaving the space it used to occupy sitting empty at the
-        # bottom instead of the splitter reclaiming it. Calling
-        # _fit_height_to_content() explicitly here (it already does
-        # invalidate + activate + an explicit resize to the real computed
-        # minimum) handles both directions the same way, deterministically,
-        # instead of leaning on an auto-grow behaviour that only ever
-        # helped in one direction.
+        self.activity_btn.setChecked(self.side_tab == "activity")
         self._fit_height_to_content()
         self.setUpdatesEnabled(True)
 
@@ -1426,11 +1799,19 @@ class MainWindow(QWidget):
     def check(self):
         self.encoders = set()
         self.has_bt2390 = False
+        self.has_st2094 = False
+        self.ffmpeg_version = None
         try:
             f = exe("ffmpeg")
             if not f:
                 self.set_state("error", "FFmpeg not found.")
                 return
+            version_output = subprocess.check_output(
+                [f, "-hide_banner", "-version"], text=True, encoding="utf-8", errors="replace",
+                stderr=subprocess.STDOUT, **no_window_kwargs())
+            version_match = re.search(r"ffmpeg version (\d+)\.(\d+)", version_output, re.IGNORECASE)
+            if version_match:
+                self.ffmpeg_version = tuple(map(int, version_match.groups()))
             filters = subprocess.check_output(
                 [f, "-hide_banner", "-filters"], text=True, encoding="utf-8", errors="replace",
                 stderr=subprocess.STDOUT, **no_window_kwargs()).lower()
@@ -1448,6 +1829,7 @@ class MainWindow(QWidget):
         except (OSError, subprocess.CalledProcessError) as e:
             self.set_state("error", f"FFmpeg capability check failed: {e}")
         finally:
+            self._update_ffmpeg_version_note()
             self._check_handbrake_encoders()
             self.refresh_caps_summary()
         # Re-run bit-depth filtering now that self.encoders/self.hb_encoders
@@ -1456,6 +1838,22 @@ class MainWindow(QWidget):
         # refresh_method_choices(force_default=True) above, applied to the
         # Encoder combo's bit-depth-filtered list instead of Tone mapping.
         self._on_bit_depth_changed(self.bit_depth_combo.currentText())
+
+    def _update_ffmpeg_version_note(self):
+        """Show a concise, actionable warning only for versions with the
+        older colour-range handling.  A missing/unparseable version should
+        not look like a failure: the ordinary capability check already
+        reports a genuinely unusable FFmpeg."""
+        if not hasattr(self, "ffmpeg_version_note"):
+            return
+        if self.ffmpeg_version and self.ffmpeg_version < (7, 1):
+            version = ".".join(map(str, self.ffmpeg_version))
+            self.ffmpeg_version_note.setText(
+                f"FFmpeg {version} detected — update to 7.1 or newer for more reliable full/limited colour-range handling.")
+            self.ffmpeg_version_note.show()
+        else:
+            self.ffmpeg_version_note.clear()
+            self.ffmpeg_version_note.hide()
 
     def _check_handbrake_encoders(self):
         """Parse `HandBrakeCLI --help`'s encoder list the same way `check()`
@@ -1548,6 +1946,12 @@ class MainWindow(QWidget):
         if current in allowed:
             self.encoder_combo.setCurrentText(current)
         self.encoder_combo.blockSignals(False)
+        # blockSignals above means a switch into/out of CPU AV1 caused by
+        # this repopulation (e.g. the previous encoder isn't valid at the
+        # new bit depth, so Qt silently lands on a different one) wouldn't
+        # otherwise reach _update_quality_range via currentTextChanged.
+        if hasattr(self, "quality_spin"):
+            self._update_quality_range()
 
     def refresh_caps_summary(self):
         def yn(ok):
@@ -1563,7 +1967,9 @@ class MainWindow(QWidget):
                              ("NVIDIA NVENC H.264", "h264_nvenc"), ("NVIDIA NVENC H.265", "hevc_nvenc"),
                              ("AMD AMF H.264", "h264_amf"), ("AMD AMF H.265", "hevc_amf"),
                              ("Apple VideoToolbox H.264", "h264_videotoolbox"),
-                             ("Apple VideoToolbox H.265", "hevc_videotoolbox")):
+                             ("Apple VideoToolbox H.265", "hevc_videotoolbox"),
+                             ("CPU AV1 (SVT-AV1)", "libsvtav1"),
+                             ("NVIDIA NVENC AV1", "av1_nvenc"), ("AMD AMF AV1", "av1_amf")):
             lines.append(f"   {yn(name in self.encoders)} {label}")
         if self.handbrake_tool:
             hb_note = (f" \u2014 {len(self.hb_encoders)} encoder(s) detected" if self.hb_encoders
@@ -1580,21 +1986,35 @@ class MainWindow(QWidget):
             + ("" if self.gpu_tool else " \u2014 not found, GPU stats will be unavailable"),
         ]
         self.caps_summary = "\n".join(lines)
-        if self.side_tab == "caps":
-            self.caps_label.setText(self.caps_summary)
 
     # ---- one-click dependency setup (Windows / winget) -----------------
+    def install_or_update_dependencies(self):
+        """Single entry point for the merged "Install missing dependencies"
+        button: install whatever's missing, or - if FFmpeg and HandBrakeCLI
+        are both already present - offer to update FFmpeg instead of just
+        telling the user there's nothing to install."""
+        if self.proc is not None or getattr(self, "_setup_proc", None) is not None:
+            QMessageBox.information(self, "Busy", "Finish or stop the current conversion/setup first.")
+            return
+        if not exe("ffmpeg") or not self.handbrake_tool:
+            self.start_dependency_setup()
+            return
+        if QMessageBox.question(
+                self, "Already installed",
+                "FFmpeg and HandBrakeCLI are already installed. Update FFmpeg to the "
+                "latest version now?") == QMessageBox.StandardButton.Yes:
+            # A portable copy is deliberately updated in the app's own
+            # folder: it never overwrites a user-managed system FFmpeg
+            # installation.
+            self._start_portable_dependency_setup(force_ffmpeg=True)
+
     def start_dependency_setup(self):
         if self.proc is not None or getattr(self, "_setup_proc", None) is not None:
             QMessageBox.information(self, "Busy", "Finish or stop the current conversion/setup first.")
             return
-        winget = shutil.which("winget")
+        winget = self._find_winget()
         if not winget:
-            QMessageBox.critical(
-                self, "winget not found",
-                "Windows Package Manager (winget) isn't available.\n\n"
-                "Install 'App Installer' from the Microsoft Store, then try again:\n"
-                "https://apps.microsoft.com/detail/9nblggh4nns1")
+            self._start_portable_dependency_setup()
             return
         todo = []
         if not exe("ffmpeg"):
@@ -1605,8 +2025,7 @@ class MainWindow(QWidget):
             QMessageBox.information(self, "Nothing to install", "FFmpeg and HandBrakeCLI are already installed.")
             return
         self._setup_queue = todo
-        self.setup_btn.setEnabled(False)
-        self.quick_install_btn.setEnabled(False)
+        self.install_btn.setEnabled(False)
         if self.side_tab != "activity":
             self.toggle_activity()
         self.write(f"\n[setup] Installing {len(todo)} package(s) via winget \u2014 a Windows permission "
@@ -1619,8 +2038,7 @@ class MainWindow(QWidget):
             refresh_windows_path()
             self.handbrake_tool = exe("HandBrakeCLI")
             self.check()
-            self.setup_btn.setEnabled(True)
-            self.quick_install_btn.setEnabled(True)
+            self.install_btn.setEnabled(True)
             QMessageBox.information(self, "Setup complete", "Dependency installation finished \u2014 see Activity log for details.")
             return
         pkg_id, name = self._setup_queue.pop(0)
@@ -1631,7 +2049,7 @@ class MainWindow(QWidget):
             bytes(p.readAllStandardOutput()).decode("utf-8", errors="replace")))
         p.finished.connect(lambda code, status, name=name: self._on_setup_item_finished(code, name))
         p.errorOccurred.connect(lambda err, name=name: self._on_setup_item_error(name))
-        p.setProgram("winget")
+        p.setProgram(self._find_winget() or "winget")
         p.setArguments(["install", "--id", pkg_id, "-e", "--silent",
                          "--accept-package-agreements", "--accept-source-agreements"])
         self._setup_proc = p
@@ -1649,43 +2067,199 @@ class MainWindow(QWidget):
     def _on_setup_item_error(self, name):
         self.write(f"[setup] Failed to launch winget for {name}.\n")
         self._setup_proc = None
-        self.setup_btn.setEnabled(True)
-        self.quick_install_btn.setEnabled(True)
+        self.install_btn.setEnabled(True)
+
+    def _find_winget(self):
+        """Find App Installer's executable even when WindowsApps is absent from PATH."""
+        candidates = [shutil.which("winget")]
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            candidates.append(str(Path(local_app_data) / "Microsoft" / "WindowsApps" / "winget.exe"))
+        return next((candidate for candidate in candidates if candidate and Path(candidate).is_file()), None)
+
+    def _start_portable_dependency_setup(self, force_ffmpeg=False):
+        """Download official portable tools when Windows Package Manager is unavailable."""
+        todo = []
+        if force_ffmpeg or not exe("ffmpeg"):
+            todo.append("FFmpeg")
+        if not self.handbrake_tool:
+            todo.append("HandBrakeCLI")
+        if not todo:
+            QMessageBox.information(self, "Nothing to install", "FFmpeg and HandBrakeCLI are already installed.")
+            return
+
+        self.install_btn.setEnabled(False)
+        if self.side_tab != "activity":
+            self.toggle_activity()
+        self.write("\n[setup] winget is unavailable. Downloading portable " + " and ".join(todo)
+                   + " to your local app-data folder…\n")
+
+        # FFmpeg is downloaded from Gyan's Windows builds. HandBrake's URL is
+        # resolved from its official GitHub release API so the app does not pin
+        # users to an obsolete CLI version. The files are unpacked only under
+        # %LOCALAPPDATA%, never into Program Files or system PATH.
+        script = r'''
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$tools = Join-Path $env:LOCALAPPDATA 'HDR-to-SDR-Converter\tools'
+$work = Join-Path $env:TEMP 'hdr-to-sdr-portable-setup'
+New-Item -ItemType Directory -Force -Path $tools, $work | Out-Null
+
+function Install-ZipTool($url, $label, $exeName, $destinationName) {
+    $zip = Join-Path $work ($destinationName + '.zip')
+    $expanded = Join-Path $work ($destinationName + '-expanded')
+    Remove-Item -Recurse -Force $expanded -ErrorAction SilentlyContinue
+    Write-Output "[setup] Downloading $label…"
+    Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+    Expand-Archive -LiteralPath $zip -DestinationPath $expanded -Force
+    $exe = Get-ChildItem -LiteralPath $expanded -Recurse -Filter $exeName | Select-Object -First 1
+    if (-not $exe) { throw "$label archive did not contain $exeName" }
+    Copy-Item -LiteralPath $exe.FullName -Destination (Join-Path $tools $exeName) -Force
+}
+
+if ($FORCE_FFMPEG -or -not (Test-Path (Join-Path $tools 'ffmpeg.exe'))) {
+    Install-ZipTool 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip' 'FFmpeg' 'ffmpeg.exe' 'ffmpeg'
+    $probe = Get-ChildItem -LiteralPath (Join-Path $work 'ffmpeg-expanded') -Recurse -Filter 'ffprobe.exe' | Select-Object -First 1
+    if ($probe) { Copy-Item -LiteralPath $probe.FullName -Destination (Join-Path $tools 'ffprobe.exe') -Force }
+}
+
+if (-not (Test-Path (Join-Path $tools 'HandBrakeCLI.exe'))) {
+    $headers = @{ 'User-Agent' = 'HDR-to-SDR-Converter portable setup' }
+    $release = Invoke-RestMethod -Headers $headers -Uri 'https://api.github.com/repos/HandBrake/HandBrake/releases/latest'
+    $asset = $release.assets | Where-Object { $_.name -match '^HandBrakeCLI-.*-win-x86_64\.zip$' } | Select-Object -First 1
+    if (-not $asset) { throw 'The latest HandBrake release has no Windows x64 CLI archive.' }
+    Install-ZipTool $asset.browser_download_url 'HandBrakeCLI' 'HandBrakeCLI.exe' 'handbrake'
+}
+
+Write-Output '[setup] Portable tools are ready.'
+'''.replace("$FORCE_FFMPEG", "$true" if force_ffmpeg else "$false")
+        p = QProcess(self)
+        p.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        p.readyReadStandardOutput.connect(lambda p=p: self.write(
+            bytes(p.readAllStandardOutput()).decode("utf-8", errors="replace")))
+        p.finished.connect(self._on_portable_setup_finished)
+        p.errorOccurred.connect(self._on_portable_setup_error)
+        p.setProgram("powershell.exe")
+        p.setArguments(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
+        self._setup_proc = p
+        p.start()
+
+    def _on_portable_setup_finished(self, code, status):
+        self._setup_proc = None
+        self.install_btn.setEnabled(True)
+        if code != 0:
+            self.write(f"[setup] Portable setup exited with code {code} — see output above.\n")
+            return
+        self.handbrake_tool = exe("HandBrakeCLI")
+        self.check()
+        QMessageBox.information(self, "Setup complete", "Portable dependency setup finished — see Activity log for details.")
+
+    def _on_portable_setup_error(self, error):
+        self.write("[setup] Failed to launch portable dependency setup.\n")
+        self._setup_proc = None
+        self.install_btn.setEnabled(True)
+
+    # ---- workflow helpers: profiles, history, queue -----------------
+    def _add_files_to_queue(self, paths):
+        accepted = [str(Path(path)) for path in paths
+                    if Path(path).is_file() and Path(path).suffix.lower() in self.VIDEO_EXTS]
+        added = 0
+        for path in accepted:
+            if path not in self.queue_paths:
+                self.queue_paths.append(path)
+                self.queue_list.addItem(Path(path).name)
+                self.queue_list.item(self.queue_list.count() - 1).setToolTip(path)
+                added += 1
+        if added and not Path(self.src_edit.text()).is_file():
+            # Adding files must be instantaneous. ffprobe analysis is useful
+            # only for the video that is about to encode, so defer it until
+            # Start instead of blocking the UI on every Add videos click.
+            self._set_source(self.queue_paths[0], analyze=False)
+        if added:
+            self.write(f"[queue] Added {added} video(s).\n")
+
+    def analyze_selected_queue_video(self):
+        row = self.queue_list.currentRow()
+        if row >= 0 and row < len(self.queue_paths):
+            self._set_source(self.queue_paths[row], analyze=False)
+        if not Path(self.src_edit.text()).is_file():
+            QMessageBox.information(self, "Analyze", "Add a video to the queue, then select it first.")
+            return
+        self.analyze()
+
+    def _remove_queue_item(self):
+        row = self.queue_list.currentRow()
+        if row >= 0:
+            self.queue_paths.pop(row)
+            self.queue_list.takeItem(row)
+
+    def start_queue(self):
+        if self.proc is not None:
+            QMessageBox.information(self, "Conversion running", "Wait for the current conversion to finish first.")
+            return
+        if not self.queue_paths:
+            QMessageBox.information(self, "Queue", "Add one or more source videos first.")
+            return
+        self.queue_running = True
+        self._start_next_queue_item()
+
+    def _start_next_queue_item(self):
+        if not self.queue_running or not self.queue_paths:
+            self.queue_running = False
+            self.write("[queue] Finished.\n")
+            return
+        path = self.queue_paths.pop(0)
+        self.queue_list.takeItem(0)
+        self._set_source(path, analyze=True)
+        self.write(f"[queue] Starting {Path(path).name}.\n")
+        QTimer.singleShot(0, self.start)
+
+    def _enough_disk_space(self):
+        destination = Path(self.dst_edit.text())
+        try:
+            free = shutil.disk_usage(destination.parent).free
+        except OSError:
+            return True
+        # Estimate from input size when bitrate metadata is unavailable; the
+        # 1.5x margin makes this a warning, not a false promise of exact size.
+        try:
+            expected = max(Path(self.src_edit.text()).stat().st_size, 512 * 1024 * 1024) * 1.5
+        except OSError:
+            expected = 512 * 1024 * 1024
+        if free >= expected:
+            return True
+        return QMessageBox.question(
+            self, "Low disk space",
+            f"Only {free / 1024 ** 3:.1f} GB is free; the output may need about {expected / 1024 ** 3:.1f} GB. Continue?") == QMessageBox.StandardButton.Yes
 
     # ---- file pickers ---------------------------------------------
     def browse_source(self):
-        x, _ = QFileDialog.getOpenFileName(
-            self, "Choose source video", "",
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Add videos to queue", "",
             "Video (*.mkv *.mp4 *.mov *.m4v *.ts *.webm);;All files (*.*)")
-        if x:
-            self._set_source(x)
+        if paths:
+            self._add_files_to_queue(paths)
 
-    def _set_source(self, x):
+    def _set_source(self, x, analyze=True):
         self.src_edit.setText(x)
         p = Path(x)
-        self.dst_edit.setText(str(p.with_name(p.stem + "_SDR.mp4")))
+        folder = self.output_folder if self.output_folder and self.output_folder.is_dir() else p.parent
+        self.dst_edit.setText(str(folder / (p.stem + "_SDR.mp4")))
         self.kind = "unknown"
         self.duration = 0.0
         self.src_width = None
         self.src_height = None
-        self.analyze()
+        if analyze:
+            self.analyze()
 
     def browse_output(self):
-        cur = self.dst_edit.text()
-        if cur:
-            p = Path(cur)
-            initdir = str(p.parent) if p.parent.is_dir() else str(Path.home())
-            initfile = p.name
-        elif self.src_edit.text():
-            sp = Path(self.src_edit.text())
-            initdir = str(sp.parent) if sp.parent.is_dir() else str(Path.home())
-            initfile = sp.stem + "_SDR.mp4"
-        else:
-            initdir, initfile = str(Path.home()), "output_SDR.mp4"
-        x, _ = QFileDialog.getSaveFileName(
-            self, "Choose SDR output", str(Path(initdir) / initfile), "MP4 (*.mp4);;MKV (*.mkv)")
-        if x:
-            self.dst_edit.setText(x)
+        initial = str(self.output_folder or (Path(self.src_edit.text()).parent if self.src_edit.text() else Path.home()))
+        folder = QFileDialog.getExistingDirectory(self, "Choose SDR output folder", initial)
+        if folder:
+            self.output_folder = Path(folder)
+            self.output_folder_btn.setText("SDR output: custom folder")
+            if self.src_edit.text():
+                self._set_source(self.src_edit.text(), analyze=False)
 
     # ---- analyze ----------------------------------------------------
     def analyze(self):
@@ -1718,6 +2292,8 @@ class MainWindow(QWidget):
             # YUV<->RGB, distinct from both transfer (PQ/HLG/gamma curve)
             # and primaries (gamut).
             matrix = (s.get("color_space") or "unknown").lower()
+            color_range = (s.get("color_range") or "unknown").lower()
+            range_name = COLOR_RANGE_NAMES.get(color_range, color_range)
             bit_depth = s.get("bits_per_raw_sample")
             if not bit_depth:
                 # Fall back to reading it out of the pix_fmt name (e.g.
@@ -1739,7 +2315,7 @@ class MainWindow(QWidget):
             dur_note = f"{format_time(self.duration)} ({self.duration:.0f}s)" if self.duration else "unknown (progress/ETA will be limited)"
             rec = self._recommend(self.kind, raw)
             src_cs = (f"{TRANSFER_NAMES.get(t, t)} \u00b7 {PRIMARIES_NAMES.get(primaries, primaries)} primaries "
-                      f"\u00b7 {MATRIX_NAMES.get(matrix, matrix)} matrix \u00b7 {bit_depth}-bit")
+                      f"\u00b7 {MATRIX_NAMES.get(matrix, matrix)} matrix \u00b7 {range_name} \u00b7 {bit_depth}-bit")
             # This app always tone-maps *to* BT.709 primaries/transfer/matrix
             # - that fixed combination is what "SDR" means here, so there's
             # no target picker to show; this line just states that fixed
@@ -1761,7 +2337,8 @@ class MainWindow(QWidget):
             headline = {"hdr": "HDR detected", "sdr": "SDR / Rec.709 detected", "dolby": "Dolby Vision detected"}[self.kind]
             headline_color = t_col["AMBER"] if self.kind == "dolby" else t_col["INDIGO"]
             res = f"{self.src_width}\u00d7{self.src_height} \u00b7 " if self.src_width and self.src_height else ""
-            src_short = f"{res}{TRANSFER_NAMES.get(t, t)} \u00b7 {PRIMARIES_NAMES.get(primaries, primaries)} \u00b7 {bit_depth}-bit"
+            src_short = (f"{res}{TRANSFER_NAMES.get(t, t)} \u00b7 {PRIMARIES_NAMES.get(primaries, primaries)} "
+                         f"\u00b7 {range_name} \u00b7 {bit_depth}-bit")
             dur_short = format_time(self.duration) if self.duration else "unknown duration"
             muted = t_col["MUTED"]
             lines = [f"<b style='color:{headline_color}'>{headline}</b>"]
@@ -1793,6 +2370,16 @@ class MainWindow(QWidget):
                 b.setEnabled(False)
             self.analysis_label.setToolTip("")
             self.analysis_label.setText(f"Analysis failed: {e}")
+        # analysis_label just went from its short placeholder text to a
+        # multi-line HTML block (or, in the except branches, to a wrapped
+        # sentence) - but it lives inside analysis_scroll, a fixed-height
+        # QScrollArea (see build()), so that no longer changes SOURCE
+        # ANALYSIS's or the window's minimum height; any overflow just
+        # scrolls. This call is kept as a harmless no-op safety net for
+        # any other height-affecting change analyze() might make (e.g.
+        # ffmpeg_version_note or another label toggling visible/hidden)
+        # rather than because analysis_label's own reflow needs it now.
+        self._fit_height_to_content()
 
     def _optimal_note(self, kind, raw):
         """What 'Optimal' means for this source - almost always just a
@@ -1960,7 +2547,13 @@ class MainWindow(QWidget):
         v = self.encoder_combo.currentText()
         e = ENCODER_MAP[v]
         q = str(self.quality_spin.value())
-        if v.startswith("CPU"):
+        if v == "CPU \u00b7 AV1":
+            # SVT-AV1's -preset is a numeric 0-13 speed/efficiency dial,
+            # not x264/x265's named presets - "medium" means nothing to
+            # it. 6 is SVT-AV1's own documented middle-of-the-road speed,
+            # the rough equivalent of x264/x265's "medium" here.
+            opts = ["-crf", q, "-preset", "6"]
+        elif v.startswith("CPU"):
             opts = ["-crf", q, "-preset", "medium"]
         elif v.startswith("NVIDIA"):
             # ffmpeg's nvenc "-cq" option treats 0 as "automatic" (i.e. NOT
@@ -2012,11 +2605,12 @@ class MainWindow(QWidget):
         if self.preview_path is None:
             # No live preview requested (shouldn't normally happen for the
             # FFmpeg backend, but fall back to the plain single-output form).
-            return base + ["-map", "0:v:0", "-map", "0:a?", "-vf", vf, "-c:v", e, *opt,
-                            "-pix_fmt", fmt, "-c:a", "copy",
+            return base + ["-map", "0:v:0", *self._ffmpeg_track_args(), "-vf", vf, "-c:v", e, *opt,
+                            "-pix_fmt", fmt, *self._ffmpeg_track_codec_args(),
                             "-movflags", "+faststart", self.dst_edit.text()]
         main_out = [
-            "-map", "[enc]", "-map", "0:a?", "-c:v", e, *opt, "-pix_fmt", fmt, "-c:a", "copy",
+            "-map", "[enc]", *self._ffmpeg_track_args(), "-c:v", e, *opt, "-pix_fmt", fmt,
+            *self._ffmpeg_track_codec_args(),
             "-movflags", "+faststart", self.dst_edit.text(),
         ]
         # Split the tone-mapped output: full-res branch goes to the encoder,
@@ -2057,6 +2651,7 @@ class MainWindow(QWidget):
                        f"falling back to 8-bit output.\n")
         cmd = [self.handbrake_tool, "-i", self.src_edit.text(), "-o", self.dst_edit.text(),
                "-e", e, "-q", str(self.quality_spin.value()), "-M", "709", "-E", "copy"]
+        cmd += ["--all-audio", "--all-subtitles"]
         # HandBrake's --colorspace filter only runs its zscale+tonemap chain
         # when asked to change the *transfer* away from PQ/HLG (see
         # libhb/colorspace.c) - transfer=bt709 is what triggers it, tonemap=
@@ -2088,6 +2683,12 @@ class MainWindow(QWidget):
     def command(self):
         return self.command_handbrake() if self.backend_combo.currentText().startswith("HandBrake") else self.command_ffmpeg()
 
+    def _ffmpeg_track_args(self):
+        return ["-map", "0:a?", "-map", "0:s?"]
+
+    def _ffmpeg_track_codec_args(self):
+        return ["-c:a", "copy", "-c:s", "copy"]
+
     # ---- run / control -------------------------------------------------
     def start(self):
         if self.proc is not None:
@@ -2108,6 +2709,8 @@ class MainWindow(QWidget):
             return
         if not Path(self.src_edit.text()).is_file() or not self.dst_edit.text():
             QMessageBox.critical(self, "Files", "Choose source and output files.")
+            return
+        if not self._enough_disk_space():
             return
         if not using_hb and not exe("ffmpeg"):
             QMessageBox.critical(self, "FFmpeg", "FFmpeg is required.")
@@ -2154,7 +2757,7 @@ class MainWindow(QWidget):
             self.preview_mtime = 0
             self.preview_path.unlink(missing_ok=True)
             self.preview_label.setText("Waiting for the first preview frame\u2026")
-        self.preview_meta_label.setText("")
+        self._set_preview_meta("")
 
         cmd = self.command()
         if using_hb and self.hb_encoders:
@@ -2316,11 +2919,44 @@ class MainWindow(QWidget):
         if ok:
             self.pbar.setValue(1000)
             self.set_state("done", "Done \u00b7 saved to output")
+            self._validate_output(Path(self.dst_edit.text()))
         elif was_stopping:
             self.set_state("idle", "Stopped")
         else:
             self.set_state("error", "Failed \u2014 see activity log")
         self.update_run_controls()
+        if self.queue_running:
+            if ok:
+                QTimer.singleShot(250, self._start_next_queue_item)
+            else:
+                self.queue_running = False
+                self.write("[queue] Stopped because one item failed.\n")
+
+    def _validate_output(self, output):
+        """Fast post-flight check: verify the muxed file exists, has a video
+        stream and remains close to the source duration.  It does not decode
+        every frame, so it is safe to run automatically after each queue item."""
+        probe = exe("ffprobe")
+        if not output.is_file():
+            self.write("[verify] Output file is missing.\n")
+            return
+        if not probe:
+            self.write(f"[verify] Output exists ({output.stat().st_size / 1024 ** 2:.1f} MB); ffprobe unavailable for a deeper check.\n")
+            return
+        try:
+            info = json.loads(subprocess.check_output(
+                [probe, "-v", "error", "-show_entries", "format=duration:stream=codec_type,width,height",
+                 "-of", "json", str(output)], text=True, encoding="utf-8", errors="replace", **no_window_kwargs()))
+            video = next((s for s in info.get("streams", []) if s.get("codec_type") == "video"), None)
+            duration = float(info.get("format", {}).get("duration") or 0)
+            if not video:
+                self.write("[verify] Warning: no video stream found in output.\n")
+            elif self.duration and abs(duration - self.duration) > max(5, self.duration * .02):
+                self.write(f"[verify] Warning: output duration {format_time(duration)} differs from source {format_time(self.duration)}.\n")
+            else:
+                self.write(f"[verify] OK · {video.get('width')}×{video.get('height')} · {format_time(duration)} · {output.stat().st_size / 1024 ** 2:.1f} MB\n")
+        except Exception as e:
+            self.write(f"[verify] Could not inspect output: {e}\n")
 
     def sample_resources(self):
         if not (self.proc and self.proc.state() == QProcess.ProcessState.Running):
@@ -2396,7 +3032,7 @@ class MainWindow(QWidget):
         proc.finished.connect(lambda *_args, gen=gen: self._on_frame_preview_finished(gen))
         self._frame_preview_proc = proc
         self.preview_label.setText("Rendering preview frame\u2026")
-        self.preview_meta_label.setText("")
+        self._set_preview_meta("")
         proc.start()
 
     def _on_frame_preview_finished(self, gen):
@@ -2417,7 +3053,7 @@ class MainWindow(QWidget):
         pix = QPixmap.fromImage(img)
         self._current_preview_pixmap = pix
         self.preview_label.setPixmap(pix.scaled(
-            max(self.preview_label.width(), 320), 260,
+            max(self.preview_label.width(), 320), 220,
             Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
         seek = max(0.0, self.duration / 2) if self.duration else 0.0
         shadow_pct, highlight_pct = clipping_pct(img)
@@ -2427,7 +3063,7 @@ class MainWindow(QWidget):
         if highlight_pct >= 0.5:
             clip_bits.append(f"{highlight_pct:.0f}% highlights clipped")
         clip_note = " \u00b7 " + " \u00b7 ".join(clip_bits) if clip_bits else " \u00b7 no clipping detected"
-        self.preview_meta_label.setText(f"Preview frame at {clock_time(seek)}" + clip_note)
+        self._set_preview_meta(f"Preview frame at {clock_time(seek)}" + clip_note)
         self.preview_expand_btn.setEnabled(True)
         self.preview_save_btn.setEnabled(True)
 
@@ -2471,17 +3107,29 @@ class MainWindow(QWidget):
                 "-movflags", "+faststart", str(out_path)]
         return cmd
 
+    def _refresh_preview_meta_display(self):
+        """Single line under the preview frame: a test-clip status message
+        takes priority over the frame's own "Preview frame at ..." meta
+        text while one is set, then the meta text reappears once the
+        status clears - instead of two labels stacked on top of each
+        other."""
+        self.preview_meta_label.setText(self._test_clip_status_text or self._preview_meta_text)
+
+    def _set_preview_meta(self, text):
+        self._preview_meta_text = text
+        self._refresh_preview_meta_display()
+
     def _set_test_clip_status(self, text):
-        self.test_clip_status.setText(text)
-        self.test_clip_status.setVisible(bool(text))
+        self._test_clip_status_text = text
+        self._refresh_preview_meta_display()
 
     def _run_test_clip(self):
         if self._test_clip_proc is not None:
             # Second click while one is running: treat it as cancel.
             self._test_clip_proc.kill()
             self._test_clip_proc = None
-            self.test_clip_btn.setText("\u25b6")
-            set_role(self.test_clip_btn, "icon-btn")
+            self.test_clip_btn.setText("Render 5s test")
+            set_role(self.test_clip_btn, "panel-toggle")
             self.test_clip_btn.setToolTip(
                 "Render 5s test clip \u2014 encode a short real clip from the middle of the "
                 "source with the current settings, through the backend that will be used "
@@ -2528,11 +3176,11 @@ class MainWindow(QWidget):
         self._test_clip_proc = proc
         self._test_clip_out = None
         self.test_clip_open_btn.setEnabled(False)
-        set_role(self.test_clip_open_btn, "icon-btn")
+        set_role(self.test_clip_open_btn, "panel-toggle")
         self.test_clip_open_btn.setToolTip(
             "Open test clip \u2014 no test clip rendered yet. Turns green once one is ready to play.")
-        self.test_clip_btn.setText("\u2715")
-        set_role(self.test_clip_btn, "icon-btn-busy")
+        self.test_clip_btn.setText("Cancel test")
+        set_role(self.test_clip_btn, "stop-ready")
         self.test_clip_btn.setToolTip("Cancel the test clip render currently in progress.")
         self._set_test_clip_status("Rendering a 5s test clip with the current settings\u2026")
         proc.start()
@@ -2540,8 +3188,8 @@ class MainWindow(QWidget):
     def _on_test_clip_finished(self, out):
         was_current = self._test_clip_proc is not None
         self._test_clip_proc = None
-        self.test_clip_btn.setText("\u25b6")
-        set_role(self.test_clip_btn, "icon-btn")
+        self.test_clip_btn.setText("Render 5s test")
+        set_role(self.test_clip_btn, "panel-toggle")
         self.test_clip_btn.setToolTip(
             "Render 5s test clip \u2014 encode a short real clip from the middle of the "
             "source with the current settings, through the backend that will be used "
@@ -2553,7 +3201,7 @@ class MainWindow(QWidget):
             return
         self._test_clip_out = out
         self.test_clip_open_btn.setEnabled(True)
-        set_role(self.test_clip_open_btn, "icon-btn-ready")
+        set_role(self.test_clip_open_btn, "panel-toggle")
         self.test_clip_open_btn.setToolTip(f"Open test clip \u2014 ready: {out}")
         self._set_test_clip_status("")
 
@@ -2619,7 +3267,7 @@ class MainWindow(QWidget):
                     pix = QPixmap.fromImage(img)
                     self._current_preview_pixmap = pix
                     self.preview_label.setPixmap(pix.scaled(
-                        max(self.preview_label.width(), 320), 260,
+                        max(self.preview_label.width(), 320), 220,
                         Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
                     self._update_preview_meta(img)
                     self.preview_expand_btn.setEnabled(True)
@@ -2635,7 +3283,7 @@ class MainWindow(QWidget):
         if highlight_pct >= 0.5:
             clip_bits.append(f"{highlight_pct:.0f}% highlights clipped")
         clip_note = " \u00b7 " + " \u00b7 ".join(clip_bits) if clip_bits else " \u00b7 no clipping detected"
-        self.preview_meta_label.setText(pos + clip_note)
+        self._set_preview_meta(pos + clip_note)
 
     # ---- live controls --------------------------------------------------
     def require_psutil(self, feature):
@@ -2742,13 +3390,29 @@ class MainWindow(QWidget):
         # narrower) resizes preview_label directly without the top-level
         # window itself being resized, so a MainWindow-level resizeEvent
         # would miss it entirely.
-        if obj is self.preview_label and event.type() == QEvent.Type.Resize:
+        if obj is getattr(self, "preview_label", None) and event.type() == QEvent.Type.Resize:
             cur = self.preview_label.pixmap()
             if cur is not None and not cur.isNull() and self._current_preview_pixmap is not None:
                 self.preview_label.setPixmap(self._current_preview_pixmap.scaled(
-                    max(self.preview_label.width(), 320), 260,
+                    max(self.preview_label.width(), 320), 220,
                     Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        # The hint label isn't in any layout (it's painted directly on the
+        # queue list's viewport, see _update_queue_hint below), so nothing
+        # resizes it automatically when the splitter is dragged or the
+        # window resized - it has to be matched to the viewport's size by
+        # hand on every viewport resize.
+        if obj is self.queue_list.viewport() and event.type() == QEvent.Type.Resize:
+            self.queue_hint_label.setGeometry(self.queue_list.viewport().rect())
         return super().eventFilter(obj, event)
+
+    def _update_queue_hint(self, *args):
+        """Show the "Drop video files here..." placeholder only while the
+        queue is empty, and keep it sized to the current viewport - called
+        once at setup and again on every add/remove via the queue list's
+        model signals (see queue_list.model().rowsInserted/rowsRemoved
+        above)."""
+        self.queue_hint_label.setGeometry(self.queue_list.viewport().rect())
+        self.queue_hint_label.setVisible(self.queue_list.count() == 0)
 
     def closeEvent(self, event):
         for p in (self.proc, self._frame_preview_proc, self._test_clip_proc,
@@ -2767,21 +3431,22 @@ class MainWindow(QWidget):
 
     def dragEnterEvent(self, event):
         urls = event.mimeData().urls() if event.mimeData().hasUrls() else []
-        path = urls[0].toLocalFile() if urls else ""
-        if path and Path(path).suffix.lower() in self.VIDEO_EXTS and not (
+        paths = [url.toLocalFile() for url in urls]
+        if any(Path(path).suffix.lower() in self.VIDEO_EXTS for path in paths) and not (
                 self.proc and self.proc.state() == QProcess.ProcessState.Running):
             event.acceptProposedAction()
 
     def dropEvent(self, event):
         urls = event.mimeData().urls() if event.mimeData().hasUrls() else []
-        path = urls[0].toLocalFile() if urls else ""
-        if not path or Path(path).suffix.lower() not in self.VIDEO_EXTS:
+        paths = [url.toLocalFile() for url in urls]
+        paths = [path for path in paths if Path(path).suffix.lower() in self.VIDEO_EXTS]
+        if not paths:
             event.ignore()
             return
         if self.proc and self.proc.state() == QProcess.ProcessState.Running:
             event.ignore()
             return
-        self._set_source(path)
+        self._add_files_to_queue(paths)
         event.acceptProposedAction()
 
 
