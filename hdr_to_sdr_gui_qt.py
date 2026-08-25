@@ -914,7 +914,7 @@ class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.i18n = Localizer()
-        self.setWindowTitle(self.tr("HDR to SDR Movie Converter"))
+        self.setWindowTitle(self.tr("HDR to SDR Video Converter"))
         self.setAcceptDrops(True)
 
         self.FONT = pick_font(["Segoe UI", "SF Pro Text", "Inter", "Ubuntu", "Helvetica Neue"], "")
@@ -1020,7 +1020,7 @@ class MainWindow(QWidget):
 
     def retranslate_static_ui(self):
         """Translate visible static captions without altering internal combo-box values."""
-        self.setWindowTitle(self.tr("HDR to SDR Movie Converter"))
+        self.setWindowTitle(self.tr("HDR to SDR Video Converter"))
         for widget in self.findChildren(QGroupBox):
             self._translate_widget_property(widget, widget.title, widget.setTitle, "i18n_title")
         for widget in self.findChildren(QLabel):
@@ -1307,8 +1307,16 @@ class MainWindow(QWidget):
 
         # header
         header = QHBoxLayout()
+        header.setSpacing(10)
+
+        app_icon = load_app_icon()
+        if not app_icon.isNull():
+            icon_label = QLabel()
+            icon_label.setPixmap(app_icon.pixmap(32, 32))
+            header.addWidget(icon_label, 0, Qt.AlignmentFlag.AlignVCenter)
+
         htitle = QVBoxLayout()
-        title = QLabel("HDR to SDR Video Converter")
+        title = QLabel("HDR → SDR")
         set_role(title, "title")
         htitle.addWidget(title)
         header.addLayout(htitle)
