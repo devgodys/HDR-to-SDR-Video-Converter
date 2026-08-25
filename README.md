@@ -35,17 +35,22 @@ Three genuinely different pipelines, not one "auto" button:
 - **H.264, H.265 and AV1 output** — CPU (x264/x265/SVT-AV1) plus hardware encoders (NVIDIA NVENC, AMD AMF/AMF AV1, Apple VideoToolbox for H.264/H.265). AV1 is royalty-free and typically needs 40-50% fewer bits than H.264 for comparable quality
 - **10-bit & 12-bit output** — free, no license, no separate build. 10-bit works with any H.265/AV1 encoder (CPU or hardware); 12-bit is CPU libx265 only, since no common hardware encoder does 12-bit HEVC
 - **Full curve library** — Hable, Reinhard, Mobius, BT.2446A, ST2094-10/40, Linear, Gamma, Clip, None, each with a hover tooltip explaining its actual tradeoffs
-- **Analyzes automatically** — pick a source and it's read (transfer characteristics, color range, HDR10+/Dolby Vision metadata) and a curve recommended right away, no separate Analyze step; the SDR output path is filled in for you too
+- **Batch queue** — add any number of source videos (via file picker or drag-and-drop) and hit Start queue to convert them one after another with the current settings, either into a single chosen output folder or, by default, next to each source file
+- **One-click presets** — once a queued video's been analyzed, apply **Optimal** (the recommended curve for that source), **Best quality** (CPU · H.265, Pro mode, low CRF, best available curve), or **Fast** (a hardware encoder if one's detected, else CPU · H.264, simple curve) without hand-translating a recommendation into dropdown picks
+- **Analyzes on demand** — analysis (transfer characteristics, color range, HDR10+/Dolby Vision metadata, a curve recommendation) runs when you click Analyze on a queued file, or automatically right before that file starts converting — kept out of the Add videos step so queuing up a batch stays instant
+- **Audio & subtitle passthrough** — all audio and subtitle tracks are copied through untouched (never re-encoded or dropped) on both the FFmpeg and HandBrake backends
+- **MP4 or MKV output container** — MP4 for the widest device/player support, or MKV when the source has subtitle or audio tracks (e.g. PGS, DTS) that MP4 can't hold when copied as-is
+- **Low disk space warning** — checks free space against an estimate of the output size before starting, and asks for confirmation rather than failing partway through
 - **Live Preview** — a real decoded-and-tone-mapped frame from your source, refreshed as you change settings, with a shadow/highlight clipping check so you can catch a curve crushing detail before committing to a full encode. View it full size or save the frame straight to disk
 - **Live bitrate estimate** — updates automatically as you change quality, resolution, or encoder (each codec's own CRF scale is accounted for), so a surprising CRF/resolution combo shows up before you hit Start, not after
 - **Hardware encoding** — CPU (x264/x265/SVT-AV1), NVIDIA NVENC, AMD AMF, Apple VideoToolbox
 - **Resolution presets** — Source, 4K, 1440p, 1080p, 720p, 480p, or custom; scaling is height-driven with width computed to match, so non-16:9 sources aren't stretched
 - **Hardware-accelerated decode** — CUDA / DXVA2 / VideoToolbox (FFmpeg backend)
 - **Interface language picker** — English plus a globe menu of other languages (translations load from an optional `i18n/` folder of JSON files; the app runs in English automatically if it isn't present), with a "System default" option that follows Windows' language
-- **Drag and drop** — drop a video file anywhere on the window to set it as the source
+- **Drag and drop** — drop one or more video files anywhere on the window to add them straight to the queue
 - **Live run controls** — pause/resume, live CPU-core affinity, and process priority, all adjustable mid-conversion
 - **Live resource monitoring** — CPU and GPU usage shown while converting
-- **Activity & System panels** — a live log of the actual FFmpeg/HandBrake output, and a report of what's detected on your system (FFmpeg, Vulkan, HandBrakeCLI) before you convert
+- **Live activity log** — a live log of the actual FFmpeg/HandBrake output as it runs
 - **One-click Windows setup** — missing FFmpeg/HandBrakeCLI installed via `winget` from inside the app, with a "Quick install" shortcut right in the header so you don't need to open a panel first. If `winget` itself isn't available, the app falls back to downloading the same official portable builds directly (no admin rights needed)
 - **Transparent by design** — the exact command line is always visible, never hidden behind "auto"
 - Light and dark themes
@@ -106,11 +111,11 @@ Or grab a prebuilt Windows `.exe` from the [latest release](https://github.com/d
 
 ## Basic workflow
 
-1. Pick a **Source** HDR file — analysis runs automatically (transfer function, bit depth, color range, duration, and a curve suggested based on what it finds: plain HDR, HDR10+ metadata, Dolby Vision, or footage that's already SDR), and the **SDR output** path is filled in for you. Drag-and-drop works too.
-2. Choose a **backend** and **curve** — BT.2390 on GPU is the sane default; fall back to Standard FFmpeg without a Vulkan-capable GPU. Hover a curve for a plain-language rundown of what it trades off.
-3. Set **resolution**, **encoder** (H.264, H.265, or AV1), and **bit depth**. Leave resolution on "Source" to keep the original frame size and aspect ratio.
+1. **Add videos** to the queue — via the file picker or by dragging one or more files onto the window — and the **SDR output** path is filled in for each (next to the source by default, or in a single output folder you choose). Adding is instant; nothing is analyzed yet.
+2. Select a queued file and click **Analyze selected video** (or just start the queue — each file is analyzed automatically right before its turn) to read its transfer function, bit depth, color range, duration, and HDR10+/Dolby Vision metadata, with a curve suggested based on what it finds.
+3. Once analyzed, either use **Optimal** / **Best quality** / **Fast** to one-click apply a recommended curve/encoder/quality combo, or set things manually: choose a **backend** and **curve** — BT.2390 on GPU is the sane default; fall back to Standard FFmpeg without a Vulkan-capable GPU (hover a curve for a plain-language rundown of what it trades off) — plus **resolution**, **encoder** (H.264, H.265, or AV1), **bit depth**, and **container** (MP4, or MKV if the source has subtitle/audio tracks MP4 can't hold). Leave resolution on "Source" to keep the original frame size and aspect ratio. Audio and subtitle tracks are always copied through untouched.
 4. Adjust **quality**, or enable **Pro mode** for the full CRF/CQ range, extra curves, and a brightness trim. Check the **Live Preview** panel — it shows an actual tone-mapped frame and flags shadow/highlight clipping, and you can view it full size or save the frame to disk — plus the live bitrate estimate, before committing.
-5. Click **Start** — progress, speed, ETA, and live FFmpeg/HandBrake output are all shown as it runs. Pause/resume, CPU-core limits, and process priority can all be adjusted mid-conversion.
+5. Click **Start queue** — each file converts in turn, with progress, speed, ETA, and live FFmpeg/HandBrake output all shown as it runs (a low-disk-space check runs first). Pause/resume, CPU-core limits, and process priority can all be adjusted mid-conversion.
 
 ## Building a standalone executable
 
