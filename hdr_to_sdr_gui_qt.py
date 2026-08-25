@@ -25,13 +25,17 @@ import sys
 import tempfile
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QProcess, QUrl, QSize, QEvent, QLocale, QSettings
-from PySide6.QtGui import QAction, QColor, QFontDatabase, QFont, QFontMetrics, QPainter, QPainterPath, QPen, QTextCursor, QIcon, QDesktopServices, QPixmap, QImage
+from PySide6.QtCore import (
+    Qt, QTimer, QProcess, QUrl, QSize, QEvent, QLocale, QSettings,
+    QPropertyAnimation, QEasingCurve, Property, QRectF, QPoint
+)
+from PySide6.QtGui import QAction, QColor, QFontDatabase, QFont, QFontMetrics, QPainter, QPainterPath, QPen, QTextCursor, QIcon, QDesktopServices, QPixmap, QImage, QPalette
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QLineEdit, QPushButton, QComboBox, QCheckBox,
     QSpinBox, QSlider, QProgressBar, QTextEdit, QGroupBox, QVBoxLayout, QHBoxLayout,
     QGridLayout, QFileDialog, QMessageBox, QFrame, QSplitter, QStackedWidget, QScrollArea,
-    QDialog, QMenu, QToolButton, QListWidget, QSizePolicy
+    QDialog, QMenu, QToolButton, QListWidget, QSizePolicy, QGraphicsDropShadowEffect,
+    QAbstractButton, QProxyStyle, QStyle
 )
 
 try:
@@ -85,13 +89,14 @@ COLOR_RANGE_NAMES = {
 
 
 LANGUAGE_NAMES = {
-    "ar": "العربية", "bg": "Български", "bn": "বাংলা", "de": "Deutsch",
-    "el": "Ελληνικά", "es": "Español", "fa": "فارسی", "fr": "Français",
-    "hi": "हिन्दी", "id": "Bahasa Indonesia", "it": "Italiano", "ja": "日本語",
-    "ko": "한국어", "ms": "Bahasa Melayu", "pl": "Polski", "pt_br": "Português (Brasil)",
+    "ar": "العربية", "bg": "Български", "bn": "বাংলা", "cs": "Čeština",
+    "de": "Deutsch", "el": "Ελληνικά", "es": "Español", "fa": "فارسی",
+    "fr": "Français", "he": "עברית", "hi": "हिन्दी", "id": "Bahasa Indonesia",
+    "it": "Italiano", "ja": "日本語", "ko": "한국어", "ms": "Bahasa Melayu",
+    "nl": "Nederlands", "pl": "Polski", "pt_br": "Português (Brasil)",
     "ro": "Română", "ru": "Русский", "sr": "Српски", "th": "ไทย",
     "tl": "Filipino", "tr": "Türkçe", "uk": "Українська", "ur": "اردو",
-    "vi": "Tiếng Việt", "zh_cn": "简体中文",
+    "vi": "Tiếng Việt", "zh_cn": "简体中文", "zh_tw": "繁體中文",
 }
 
 
@@ -121,7 +126,9 @@ class Localizer:
         if system_code.startswith("pt"):
             return "pt_br"
         if system_code.startswith("zh"):
-            return "zh_cn"
+            # Traditional-script regions/variants map to zh_tw; everything
+            # else (zh_cn, zh_sg, bare "zh", ...) falls back to Simplified.
+            return "zh_tw" if system_code.split("_")[-1] in ("tw", "hk", "mo", "hant") else "zh_cn"
         base = system_code.split("_", 1)[0]
         return base if base in LANGUAGE_NAMES else "en"
 
@@ -256,7 +263,8 @@ PRIORITY_NICE = {"Efficiency (low)": 10, "Balanced": 0, "Performance (high)": -5
 # Shared fixed width for the numeric spin boxes that sit next to a slider
 # (Quality, Brightness boost, CPU cores) - so all three rows line up instead
 # of each spin box sizing itself to its own digit count.
-SPIN_WIDTH = 90
+SPIN_WIDTH = 56  # spin box alone, now flanked by round -/+ stepper buttons
+# (was 90px when the spin box's own native up/down arrows had to fit inside it)
 
 # ---- bitrate estimation (rough, content-dependent) -------------------
 # This is a ballpark only - CRF/CQ/QP rate control lets the encoder use
@@ -657,6 +665,107 @@ def set_role(widget, role):
     widget.style().polish(widget)
 
 
+def make_stepper(spin: QSpinBox) -> QWidget:
+    """Wrap a QSpinBox with round -/+ buttons and hide its native
+    up/down buttons (boxy and, on some native Windows styles, prone to
+    QSS-vs-native-chrome mismatches - see QSlider groove note in main()).
+    spin itself is untouched: same widget, same .value()/.setValue()/
+    .valueChanged/.setEnabled() any existing code already uses - only its
+    container widget is new, so call sites just need to add that
+    container to a layout instead of the bare spin box."""
+    minus_btn = QPushButton("\u2212")
+    plus_btn = QPushButton("+")
+    for b in (minus_btn, plus_btn):
+        set_role(b, "stepper")
+        b.setFixedSize(26, 26)
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+    set_role(spin, "stepper-spin")
+    spin.setFixedHeight(26)  # match the round buttons exactly so the row
+    # doesn't rely on QHBoxLayout's cross-axis centering (which left the
+    # number a few px off from the +/- buttons when their sizeHints differed)
+    minus_btn.clicked.connect(spin.stepDown)
+    plus_btn.clicked.connect(spin.stepUp)
+
+    def sync_enabled():
+        minus_btn.setEnabled(spin.isEnabled() and spin.value() > spin.minimum())
+        plus_btn.setEnabled(spin.isEnabled() and spin.value() < spin.maximum())
+
+    spin.valueChanged.connect(lambda _v: sync_enabled())
+    sync_enabled()
+
+    wrap = QWidget()
+    wrap.setStyleSheet("background: transparent;")
+    row = QHBoxLayout(wrap)
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(4)
+    row.addWidget(minus_btn)
+    row.addWidget(spin)
+    row.addWidget(plus_btn)
+
+    # Existing code toggles spin.setEnabled(...) directly (e.g. brightness
+    # controls). Piggyback on that instead of requiring every call site to
+    # also remember to enable/disable the two new buttons: wrap setEnabled
+    # so the buttons always mirror the spin box's state without touching
+    # any of the ~6 existing .setEnabled(...) call sites.
+    original_set_enabled = spin.setEnabled
+
+    def set_enabled(enabled):
+        original_set_enabled(enabled)
+        sync_enabled()
+
+    spin.setEnabled = set_enabled
+    return wrap
+
+
+def chevron_icon_path(hex_color, size=20):
+    """Render (and cache on disk) a small down-chevron PNG in the given
+    colour, for use as QComboBox::down-arrow - QSS can't draw a shape
+    itself, and the native OS triangle sits inside its own boxed-off
+    ::drop-down section with a divider line next to it. One flat icon,
+    one fixed colour, no per-state variants: that's what caused the
+    earlier "doubled arrow" glitch (a second, differently-styled image
+    swapped in on hover and briefly rendered on top of the first)."""
+    cache_dir = Path(tempfile.gettempdir()) / "hdr2sdr_ui_icons"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    path = cache_dir / f"chevron_{hex_color.lstrip('#')}_{size}.png"
+    if not path.exists():
+        pix = QPixmap(size, size)
+        pix.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pix)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor(hex_color))
+        pen.setWidthF(1.6)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        w, h = size * 0.5, size * 0.26
+        cx, cy = size / 2, size / 2
+        arrow = QPainterPath()
+        arrow.moveTo(cx - w / 2, cy - h / 2)
+        arrow.lineTo(cx, cy + h / 2)
+        arrow.lineTo(cx + w / 2, cy - h / 2)
+        painter.drawPath(arrow)
+        painter.end()
+        pix.save(str(path), "PNG")
+    return str(path).replace("\\", "/")
+
+
+class NoMenuStylePopupStyle(QProxyStyle):
+    """QComboBox popups default to Qt's "menu style" list (SH_ComboBox_Popup),
+    which shows a scrollable list via its own up/down scroller buttons instead
+    of a normal QScrollBar when the list doesn't fit the screen. Those
+    scroller buttons are painted straight through QStyle primitives rather
+    than as a styleable child widget/class, so no QSS selector can reach them
+    - they always show up in the platform's default (opaque light) colour
+    regardless of theme. Turning this style hint off makes Qt fall back to
+    an ordinary list with a normal, themeable QScrollBar instead."""
+    def styleHint(self, hint, option=None, widget=None, returnData=None):
+        if hint == QStyle.StyleHint.SH_ComboBox_Popup:
+            return 0
+        return super().styleHint(hint, option, widget, returnData)
+
+
 def loosen_combo(combo, min_chars=12):
     """QComboBox defaults to sizing itself so its *widest item* always fits
     without eliding - with entries like "ST2094-40 (HDR10+) . GPU
@@ -672,23 +781,140 @@ def loosen_combo(combo, min_chars=12):
     combo.setToolTip(combo.currentText())
 
 
-class Card(QGroupBox):
-    """A titled card matching the compact-utility-card look: thin border,
-    flat card-colour fill, bold small-caps-ish header."""
+class _AppToolTip(QLabel):
+    """Replacement for the native QToolTip, installed as an app-wide event
+    filter (see MainWindow.eventFilter). Needed because the native tooltip
+    stays solid black on some Windows/Qt combinations no matter what
+    palette or style-sheet is set on it - both QApplication.setPalette()
+    and the dedicated QToolTip.setPalette() were tried and neither stuck,
+    so this sidesteps native tooltip rendering entirely and draws a plain
+    QLabel of our own instead."""
+
+    def __init__(self):
+        super().__init__(None, Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setWordWrap(True)
+        self.setMaximumWidth(420)
+
+
+class Card(QFrame):
+    """A titled card: soft-rounded flat fill, subtle drop shadow, and a
+    plain in-flow title label instead of QGroupBox's native "title cut
+    into the border" chrome - reads as a modern raised surface rather
+    than a legacy Windows group box. The title is a regular QLabel, so
+    the existing generic QLabel i18n pass in retranslate_static_ui()
+    picks it up automatically - no separate translation wiring needed."""
 
     def __init__(self, title, parent=None):
-        super().__init__(title, parent)
+        super().__init__(parent)
         self.setProperty("role", "card")
-        self.body = QVBoxLayout(self)
-        self.body.setContentsMargins(16, 12, 16, 10)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(18, 10, 18, 12)
+        outer.setSpacing(6)
+
+        self.title_label = QLabel(title)
+        set_role(self.title_label, "card-title")
+        outer.addWidget(self.title_label)
+
+        self.body = QVBoxLayout()
+        self.body.setContentsMargins(0, 0, 0, 0)
         self.body.setSpacing(6)
+        outer.addLayout(self.body)
+
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(28)
+        shadow.setOffset(0, 3)
+        shadow.setColor(QColor(0, 0, 0, 45))
+        self.setGraphicsEffect(shadow)
+
+
+class ToggleSwitch(QAbstractButton):
+    """iOS-style animated toggle switch with a trailing text label -
+    drop-in replacement for QCheckBox(text): same isChecked() /
+    setChecked() / toggled API, so call sites and translation logic
+    (which just calls .text()/.setText()/.toolTip()) don't need to
+    change. Unlike a QSS-only checkbox indicator, the knob position is
+    a real animated QPropertyAnimation, not an instant state swap.
+
+    Colours come from the current theme via Qt properties (on_color/
+    off_color/text_color) set in apply_theme() - paintEvent() reads
+    them fresh each frame instead of hardcoding a palette, so light/
+    dark switching and the animation share the same code path."""
+
+    def __init__(self, text="", parent=None):
+        super().__init__(parent)
+        self.setText(text)
+        self.setCheckable(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._track_w = 40
+        self._track_h = 22
+        self._pos = 0.0  # 0 = off, 1 = on
+        self._anim = QPropertyAnimation(self, b"knobPos", self)
+        self._anim.setDuration(180)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.toggled.connect(self._animate_to)
+
+    def _get_knob_pos(self):
+        return self._pos
+
+    def _set_knob_pos(self, value):
+        self._pos = value
+        self.update()
+
+    knobPos = Property(float, _get_knob_pos, _set_knob_pos)
+
+    def _animate_to(self, checked):
+        self._anim.stop()
+        self._anim.setStartValue(self._pos)
+        self._anim.setEndValue(1.0 if checked else 0.0)
+        self._anim.start()
+
+    def sizeHint(self):
+        fm = QFontMetrics(self.font())
+        extra = (8 + fm.horizontalAdvance(self.text())) if self.text() else 0
+        return QSize(self._track_w + extra, max(self._track_h, fm.height()) + 6)
+
+    def hitButton(self, pos):
+        return self.rect().contains(pos)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        off = QColor(self.property("off_color") or "#B4B2A9")
+        on = QColor(self.property("on_color") or "#1968E0")
+        mix = QColor(
+            round(off.red() + (on.red() - off.red()) * self._pos),
+            round(off.green() + (on.green() - off.green()) * self._pos),
+            round(off.blue() + (on.blue() - off.blue()) * self._pos),
+        )
+        if not self.isEnabled():
+            mix = QColor(self.property("off_color") or "#B4B2A9")
+
+        track = QRectF(0, (self.height() - self._track_h) / 2, self._track_w, self._track_h)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(mix)
+        painter.drawRoundedRect(track, self._track_h / 2, self._track_h / 2)
+
+        knob_d = self._track_h - 4
+        knob_x = track.x() + 2 + self._pos * (self._track_w - knob_d - 4)
+        painter.setBrush(QColor("#FFFFFF"))
+        painter.drawEllipse(QRectF(knob_x, track.y() + 2, knob_d, knob_d))
+
+        if self.text():
+            painter.setPen(QColor(self.property("text_color") or "#1C1C1A"))
+            painter.setFont(self.font())
+            text_rect = QRectF(self._track_w + 8, 0, self.width() - self._track_w - 8, self.height())
+            painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self.text())
+        painter.end()
 
 
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.i18n = Localizer()
-        self.setWindowTitle(self.tr("HDR to SDR Video Converter"))
+        self.setWindowTitle(self.tr("HDR to SDR Movie Converter"))
         self.setAcceptDrops(True)
 
         self.FONT = pick_font(["Segoe UI", "SF Pro Text", "Inter", "Ubuntu", "Helvetica Neue"], "")
@@ -739,8 +965,19 @@ class MainWindow(QWidget):
         self.gpu_tool = shutil.which("nvidia-smi")
         self.handbrake_tool = exe("HandBrakeCLI")
         self.theme_name = "light"
+        self._tooltip = _AppToolTip()
 
         self.build()
+        # Installed only now, after every widget referenced anywhere in
+        # eventFilter() (queue_list, preview_label, ...) actually exists -
+        # doing this earlier meant Qt's synchronous events fired *during*
+        # widget construction (ChildAdded/ParentChange etc. don't wait for
+        # an event loop) were already reaching eventFilter() and hitting
+        # self.queue_list before build() had created it, raising inside a
+        # C++-invoked virtual method - which PySide6 doesn't recover from
+        # cleanly and instead surfaces as an unrelated-looking
+        # "QVBoxLayout returned NULL" crash a few widget constructions later.
+        QApplication.instance().installEventFilter(self)
         self.retranslate_static_ui()
         self.apply_theme()
         # ---- TEST BUILD: synchronous startup, one-shot sizing --------
@@ -783,7 +1020,7 @@ class MainWindow(QWidget):
 
     def retranslate_static_ui(self):
         """Translate visible static captions without altering internal combo-box values."""
-        self.setWindowTitle(self.tr("HDR to SDR Video Converter"))
+        self.setWindowTitle(self.tr("HDR to SDR Movie Converter"))
         for widget in self.findChildren(QGroupBox):
             self._translate_widget_property(widget, widget.title, widget.setTitle, "i18n_title")
         for widget in self.findChildren(QLabel):
@@ -791,13 +1028,13 @@ class MainWindow(QWidget):
         for widget in self.findChildren(QPushButton):
             self._translate_widget_property(widget, widget.text, widget.setText, "i18n_text")
             self._translate_widget_property(widget, widget.toolTip, widget.setToolTip, "i18n_tooltip")
-        for widget in self.findChildren(QCheckBox):
+        for widget in self.findChildren(ToggleSwitch):
             self._translate_widget_property(widget, widget.text, widget.setText, "i18n_text")
             self._translate_widget_property(widget, widget.toolTip, widget.setToolTip, "i18n_tooltip")
         self.language_button.setText("")
         self.theme_btn.setText("")
         self.theme_btn.setToolTip(
-            self.tr("☀ Light mode") if self.theme_name == "dark" else self.tr("🌙 Dark mode"))
+            self.tr("Light mode") if self.theme_name == "dark" else self.tr("Dark mode"))
         self.language_button.setToolTip(self.tr("Interface language"))
 
     def rebuild_language_menu(self):
@@ -819,13 +1056,15 @@ class MainWindow(QWidget):
     # ---- theming ---------------------------------------------------
     def apply_theme(self):
         t = THEMES[self.theme_name]
+        chevron_icon = chevron_icon_path(t['MUTED'])
         qss = f"""
         QWidget {{ background: {t['BG']}; color: {t['TXT']}; font-family: '{self.FONT}'; }}
-        QGroupBox[role="card"], QFrame[role="card"] {{
-            background: {t['CARD']}; border: 1px solid {t['BORDER']}; border-radius: 6px;
-            margin-top: 16px; font-family: '{self.FONT_SEMI}'; font-size: 9pt; font-weight: 600;
+        QFrame[role="card"] {{
+            background: {t['CARD']}; border: 1px solid {t['BORDER']}; border-radius: 12px;
         }}
-        QGroupBox[role="card"]::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px; color: {t['TXT']}; }}
+        QLabel[role="card-title"] {{
+            font-family: '{self.FONT_SEMI}'; font-size: 10pt; font-weight: 600; color: {t['TXT']};
+        }}
         QLabel {{ background: transparent; }}
         QLabel[role="muted"] {{ color: {t['MUTED']}; font-size: 9pt; }}
         QLabel[role="info"] {{ color: {t['INDIGO']}; font-weight: 600; font-size: 9pt; }}
@@ -836,24 +1075,89 @@ class MainWindow(QWidget):
         QLabel[role="subtitle"] {{ color: {t['MUTED']}; }}
         QLabel[role="mono"] {{ font-family: '{self.MONO}'; font-size: 9pt; color: {t['MUTED']}; }}
         QLineEdit, QComboBox, QSpinBox {{
-            background: {t['FIELD']}; border: 1px solid {t['BORDER']}; border-radius: 4px; padding: 5px 7px;
+            background: {t['FIELD']}; border: 1px solid {t['BORDER']}; border-radius: 8px; padding: 6px 8px;
         }}
+        QLineEdit:hover, QComboBox:hover, QSpinBox:hover {{ border-color: {t['INDIGO']}; }}
+        QLineEdit:focus, QComboBox:focus, QSpinBox:focus {{ border: 1.5px solid {t['INDIGO']}; }}
         QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled {{ color: {t['MUTED']}; background: {t['DISABLED']}; }}
+        QComboBox:on {{ border: 1.5px solid {t['INDIGO']}; }}
+        QComboBox::drop-down {{
+            subcontrol-origin: padding; subcontrol-position: top right;
+            width: 22px; border: none; background: transparent;
+        }}
+        QComboBox::down-arrow {{
+            image: url({chevron_icon}); width: 10px; height: 10px;
+        }}
+        QComboBox QAbstractItemView {{
+            background: {t['CARD']}; border: 1px solid {t['BORDER']}; border-radius: 0px;
+            padding: 4px; outline: none;
+        }}
+        QComboBoxPrivateScroller {{
+            background: {t['CARD']}; border: none;
+        }}
+        QComboBox QAbstractItemView QScrollBar:vertical {{
+            background: transparent; width: 10px; margin: 4px 2px 4px 0px; border: none;
+        }}
+        QComboBox QAbstractItemView QScrollBar::handle:vertical {{
+            background: {t['BORDER']}; border-radius: 4px; min-height: 24px;
+        }}
+        QComboBox QAbstractItemView QScrollBar::handle:vertical:hover {{
+            background: {t['MUTED']};
+        }}
+        QComboBox QAbstractItemView QScrollBar::add-line:vertical,
+        QComboBox QAbstractItemView QScrollBar::sub-line:vertical {{
+            height: 0px; border: none; background: transparent;
+        }}
+        QComboBox QAbstractItemView QScrollBar::add-page:vertical,
+        QComboBox QAbstractItemView QScrollBar::sub-page:vertical {{
+            background: transparent;
+        }}
+        QComboBox QAbstractItemView::item {{
+            padding: 7px 10px; border-radius: 6px; min-height: 20px; color: {t['TXT']}; background: transparent;
+        }}
+        QComboBox QAbstractItemView::item:focus {{ border: none; outline: none; }}
+        QComboBox QAbstractItemView::item:hover {{ background: {t['CARD2']}; }}
+        QComboBox QAbstractItemView::item:selected {{ background: {t['INDIGO']}; color: white; }}
+        QListWidget {{
+            background: {t['CARD']}; border: 1px solid {t['BORDER']}; border-radius: 8px;
+            padding: 4px; outline: none; color: {t['TXT']};
+        }}
+        QListWidget::item {{
+            padding: 6px 8px; border-radius: 6px; background: transparent;
+        }}
+        QListWidget::item:hover {{ background: {t['CARD2']}; }}
+        QListWidget::item:selected {{ background: {t['INDIGO']}; color: white; }}
+        QListWidget::item:selected:!active {{ background: {t['INDIGO']}; color: white; }}
+        QSpinBox[role="stepper-spin"] {{
+            padding: 0px 2px; text-align: center; qproperty-alignment: AlignCenter;
+        }}
+        QSpinBox[role="stepper-spin"]::up-button, QSpinBox[role="stepper-spin"]::down-button {{
+            width: 0px; border: none;
+        }}
+        QPushButton[role="stepper"] {{
+            background: transparent; border: 1px solid {t['BORDER']}; border-radius: 13px;
+            padding: 0px 0px 2px 0px; font-size: 11pt; font-weight: 600; color: {t['TXT']};
+        }}
+        QPushButton[role="stepper"]:hover {{ background: {t['INDIGO']}; color: white; border-color: {t['INDIGO']}; }}
+        QPushButton[role="stepper"]:pressed {{ background: {t['INDIGO2']}; color: white; }}
+        QPushButton[role="stepper"]:disabled {{ color: {t['MUTED']}; background: transparent; border-color: {t['BORDER']}; }}
         QPushButton {{
-            background: {t['CARD']}; border: 1px solid {t['BORDER']}; border-radius: 4px; padding: 7px 12px;
+            background: {t['CARD']}; border: 1px solid {t['BORDER']}; border-radius: 8px; padding: 8px 14px;
         }}
         QPushButton:hover {{ background: {t['CARD2']}; }}
         QPushButton:disabled {{ color: {t['MUTED']}; background: {t['DISABLED']}; border-color: {t['BORDER']}; }}
-        QPushButton[role="go"] {{ background: {t['INDIGO']}; color: white; font-weight: 600; border: none; }}
+        QPushButton[role="go"] {{
+            background: {t['INDIGO']}; color: white; font-weight: 600; border: none; min-height: 20px;
+        }}
         QPushButton[role="go"]:hover {{ background: {t['INDIGO2']}; }}
-        QPushButton[role="stop-ready"] {{ background: {t['RED']}; color: white; border: none; }}
+        QPushButton[role="stop-ready"] {{ background: {t['RED']}; color: white; border: none; min-height: 20px; }}
         QPushButton[role="stop-ready"]:hover {{ background: {t['RED2']}; }}
-        QPushButton[role="pause-ready"] {{ background: {t['AMBER']}; color: white; border: none; }}
+        QPushButton[role="pause-ready"] {{ background: {t['AMBER']}; color: white; border: none; min-height: 20px; }}
         QPushButton[role="pause-ready"]:hover {{ background: {t['AMBER2']}; }}
-        QPushButton[role="resume-ready"] {{ background: {t['GREEN']}; color: white; border: none; }}
+        QPushButton[role="resume-ready"] {{ background: {t['GREEN']}; color: white; border: none; min-height: 20px; }}
         QPushButton[role="resume-ready"]:hover {{ background: {t['GREEN2']}; }}
         QPushButton[role="theme"], QToolButton[role="theme"] {{
-            background: {t['CARD']}; border: 1px solid {t['BORDER']}; border-radius: 4px; padding: 7px 10px;
+            background: {t['CARD']}; border: 1px solid {t['BORDER']}; border-radius: 8px; padding: 7px 10px;
         }}
         QToolButton[role="theme"]::menu-indicator {{ image: none; width: 0px; }}
         QPushButton[role="kofi"] {{ background: #FF5E5B; color: white; border: none; font-weight: 600; }}
@@ -863,7 +1167,7 @@ class MainWindow(QWidget):
         }}
         QPushButton[role="toggle"]:hover {{ color: {t['INDIGO']}; }}
         QPushButton[role="panel-toggle"] {{
-            background: {t['CARD2']}; border: 1px solid {t['BORDER']}; border-radius: 6px;
+            background: {t['CARD2']}; border: 1px solid {t['BORDER']}; border-radius: 8px;
             padding: 6px 14px; color: {t['MUTED']}; font-weight: 600;
         }}
         QPushButton[role="panel-toggle"]:hover {{
@@ -874,16 +1178,16 @@ class MainWindow(QWidget):
         }}
         QPushButton[role="panel-toggle"]:checked:hover {{ background: {t['INDIGO2']}; }}
         QFrame[role="toolbar"] {{
-            background: {t['BG']}; border: 1px solid {t['BORDER']}; border-radius: 6px;
+            background: {t['BG']}; border: 1px solid {t['BORDER']}; border-radius: 8px;
         }}
         QPushButton[role="preview-view"] {{
             background: transparent; color: {t['INDIGO']}; border: 1.5px solid {t['INDIGO']};
-            border-radius: 6px; font-weight: 600; padding: 5px 16px;
+            border-radius: 8px; font-weight: 600; padding: 5px 16px;
         }}
         QPushButton[role="preview-view"]:hover {{ background: {t['INDIGO']}; color: white; }}
         QPushButton[role="preview-save"] {{
             background: transparent; color: {t['GREEN']}; border: 1.5px solid {t['GREEN']};
-            border-radius: 6px; font-weight: 600; padding: 5px 16px;
+            border-radius: 8px; font-weight: 600; padding: 5px 16px;
         }}
         QPushButton[role="preview-save"]:hover {{ background: {t['GREEN']}; color: white; }}
         QPushButton[role="preview-view"]:disabled, QPushButton[role="preview-save"]:disabled {{
@@ -905,25 +1209,67 @@ class MainWindow(QWidget):
             border-radius: 8px; font-size: 13pt; padding: 0px; font-weight: 600;
         }}
         QPushButton[role="icon-btn-busy"]:hover {{ background: {t['AMBER2']}; border-color: {t['AMBER2']}; }}
-        QCheckBox {{ background: transparent; }}
-        QSlider::groove:horizontal {{ height: 4px; background: {t['FIELD']}; border: 1px solid {t['BORDER']}; border-radius: 2px; }}
-        QSlider::handle:horizontal {{ width: 14px; margin: -6px 0; background: {t['INDIGO']}; border-radius: 7px; }}
-        QProgressBar {{
-            background: {t['DISABLED']}; border: none; border-radius: 5px;
-            min-height: 10px; max-height: 10px; text-align: center; color: transparent;
+        QSlider {{ min-height: 26px; background: transparent; }}
+        QSlider::groove:horizontal {{
+            height: 4px; border-radius: 2px; background: {t['BORDER']}; border: none; margin: 0px;
         }}
-        QProgressBar::chunk {{ background: {t['INDIGO']}; border-radius: 5px; }}
-        QProgressBar[state="warn"]::chunk {{ background: {t['AMBER']}; }}
-        QProgressBar[state="good"]::chunk {{ background: {t['GREEN']}; }}
-        QProgressBar[state="bad"]::chunk {{ background: {t['RED']}; }}
+        QSlider::sub-page:horizontal {{
+            height: 4px; border-radius: 2px; background: {t['INDIGO']}; border: none; margin: 0px;
+        }}
+        QSlider::add-page:horizontal {{
+            height: 4px; border-radius: 2px; background: {t['BORDER']}; border: none; margin: 0px;
+        }}
+        QSlider::handle:horizontal {{
+            width: 20px; height: 20px; margin: -9px 0; border-radius: 10px;
+            background: #FFFFFF; border: 1px solid {t['BORDER']};
+        }}
+        QSlider::handle:horizontal:hover {{ border: 1.5px solid {t['INDIGO']}; }}
+        QSlider::handle:horizontal:pressed {{ border: 1.5px solid {t['INDIGO2']}; }}
+        QProgressBar {{
+            background: {t['DISABLED']}; border: none; border-radius: 6px;
+            min-height: 12px; max-height: 12px; text-align: center; color: transparent;
+        }}
+        QProgressBar::chunk {{
+            border-radius: 6px;
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {t['INDIGO']}, stop:1 {t['INDIGO2']});
+        }}
+        QProgressBar[state="warn"]::chunk {{
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {t['AMBER']}, stop:1 {t['AMBER2']});
+        }}
+        QProgressBar[state="good"]::chunk {{
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {t['GREEN']}, stop:1 {t['GREEN2']});
+        }}
+        QProgressBar[state="bad"]::chunk {{
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {t['RED']}, stop:1 {t['RED2']});
+        }}
         QTextEdit[role="log"] {{
-            background: {t['LOG_BG']}; color: {t['LOG_FG']}; border: 1px solid {t['BORDER']}; border-radius: 4px;
+            background: {t['LOG_BG']}; color: {t['LOG_FG']}; border: 1px solid {t['BORDER']}; border-radius: 8px;
             font-family: '{self.MONO}'; font-size: 9pt;
         }}
         QSplitter::handle {{ background: transparent; margin: 0 2px; }}
-        QSplitter::handle:hover {{ background: {t['INDIGO']}; }}
+        QSplitter::handle:hover {{ background: transparent; }}
         """
         self.setStyleSheet(qss)
+        # Neither QApplication.setPalette() nor the dedicated
+        # QToolTip.setPalette() kept the native tooltip from rendering
+        # solid black on this machine - some Windows/Qt combinations force
+        # their own tooltip chrome regardless. Styling our own _AppToolTip
+        # QLabel instead (shown via the app-wide event filter below,
+        # swallowing the real QEvent.ToolTip) sidesteps native tooltip
+        # rendering entirely, so this is the one place that actually needs
+        # to reflect the current theme's colours.
+        self._tooltip.setStyleSheet(f"""
+            QLabel {{
+                background: {t['CARD']}; color: {t['TXT']}; border: 1px solid {t['BORDER']};
+                border-radius: 8px; padding: 8px 10px; font-size: 9pt;
+            }}
+        """)
+        for tw in (getattr(self, "pro_mode_chk", None), getattr(self, "hwaccel_chk", None)):
+            if tw is not None:
+                tw.setProperty("on_color", t["INDIGO"])
+                tw.setProperty("off_color", t["BORDER"])
+                tw.setProperty("text_color", t["TXT"])
+                tw.update()
         # setStyleSheet() queues a style-change/polish for every affected
         # widget instead of applying it synchronously. Card.body's own
         # margins are set in code (setContentsMargins), so they're
@@ -941,7 +1287,7 @@ class MainWindow(QWidget):
         self.language_button.setText("")
         self.theme_btn.setText("")
         self.theme_btn.setToolTip(
-            self.tr("☀ Light mode") if self.theme_name == "dark" else self.tr("🌙 Dark mode"))
+            self.tr("Light mode") if self.theme_name == "dark" else self.tr("Dark mode"))
         # Sized here (not at widget-creation time) because the "muted"
         # role's real 9pt font only exists after the stylesheet above is
         # applied and polished - reading fontMetrics() any earlier sees the
@@ -987,7 +1333,7 @@ class MainWindow(QWidget):
 
         self.theme_btn = QToolButton()
         self.theme_btn.setText("")
-        self.theme_btn.setToolTip("🌙 Dark mode")
+        self.theme_btn.setToolTip("Dark mode")
         self.theme_btn.setFixedSize(38, 34)
         set_role(self.theme_btn, "theme")
         self.theme_btn.clicked.connect(self.toggle_theme)
@@ -1013,7 +1359,7 @@ class MainWindow(QWidget):
         self.splitter.setStretchFactor(1, 1)
 
         # ---- FILES ----
-        self.files_card = files = Card("FILES")
+        self.files_card = files = Card("Files")
         # Without this, Qt's box layout lets this card float up toward its
         # *preferred* size (the queue list can grow from 64px to its 90px
         # cap) before the cards below it even get their guaranteed minimum
@@ -1084,7 +1430,7 @@ class MainWindow(QWidget):
         left.addWidget(files)
 
         # ---- SOURCE ANALYSIS ----
-        analysis = Card("SOURCE ANALYSIS")
+        analysis = Card("Source analysis")
         # Same reasoning as FILES above.
         analysis.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         self.analysis_label = QLabel("Select a video to analyze it automatically.")
@@ -1176,7 +1522,7 @@ class MainWindow(QWidget):
         # a real conversion is running, a real frame from the actual
         # tone-mapped/encoded output (ffmpeg splits the stream into the
         # encode + preview branches - see command_ffmpeg) takes over.
-        preview = Card("LIVE PREVIEW")
+        preview = Card("Live preview")
         # The card needs room for the fixed viewport, caption and the action
         # row. A hand-typed setMinimumHeight() here previously understated
         # the real content height (fixed 220px viewport + caption + button
@@ -1254,7 +1600,7 @@ class MainWindow(QWidget):
         left.addWidget(preview)
 
         # ---- PROGRESS ----
-        progress = Card("PROGRESS")
+        progress = Card("Progress")
         # Same reasoning as LIVE PREVIEW above: don't let this card be
         # compressed below its real content height.
         progress.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
@@ -1292,7 +1638,7 @@ class MainWindow(QWidget):
         left.addWidget(progress)
 
         # ---- CONTROLS ----
-        self.controls_card = controls = Card("CONTROLS")
+        self.controls_card = controls = Card("Controls")
 
         run_row = QHBoxLayout()
         self.go_btn = QPushButton("Start")
@@ -1333,6 +1679,7 @@ class MainWindow(QWidget):
         self.cores_spin.setValue(CPU_COUNT)
         self.cores_spin.setFixedWidth(SPIN_WIDTH)
         self.cores_slider = QSlider(Qt.Orientation.Horizontal)
+        self.cores_slider.setFixedHeight(26)
         self.cores_slider.setRange(1, CPU_COUNT)
         self.cores_slider.setValue(CPU_COUNT)
         self.cores_spin.valueChanged.connect(self.cores_slider.setValue)
@@ -1343,7 +1690,7 @@ class MainWindow(QWidget):
         self.priority_combo.setCurrentText("Balanced")
         loosen_combo(self.priority_combo, 10)
         self.priority_combo.currentIndexChanged.connect(self._schedule_live_apply)
-        cf.addWidget(self.cores_spin)
+        cf.addWidget(make_stepper(self.cores_spin))
         cf.addWidget(self.cores_slider, 1)
         cf.addWidget(self.priority_combo)
         controls.body.addLayout(cf)
@@ -1352,35 +1699,24 @@ class MainWindow(QWidget):
         note.setWordWrap(True)
         set_role(note, "muted")
         controls.body.addWidget(note)
-        # CONTROLS is fixed-height now: no addStretch(1) inside its body,
-        # and no stretch factor on the addWidget() call below. Between
-        # this, SOURCE ANALYSIS being pinned via a QScrollArea (see
-        # analysis_scroll above) and LIVE PREVIEW's own setFixedHeight,
-        # every card in the left column now sizes itself off its real
-        # content only - the left column's total height is therefore
-        # constant, not something that grows to soak up whatever QSplitter
-        # forces onto it. CONVERSION (see conv.body.addStretch(1) further
-        # down) is the one card left with a stretch, and is the one
-        # expected to flex to match the left column - not the other way
-        # round. See left.addStretch(1) below for the (rare-case) fallback
-        # if that assumption is ever wrong.
-        left.addWidget(controls)
-        # Fallback only, not the everyday case: with FILES/SOURCE
-        # ANALYSIS/LIVE PREVIEW/PROGRESS/CONTROLS all fixed-height, the
-        # left column's minimum is normally already >= CONVERSION's, so
-        # this stretch has nothing to do - CONVERSION's own
-        # addStretch(1) is what actually absorbs the gap between the two
-        # columns in that ordinary case. This exists for the opposite,
-        # unusual case: if CONVERSION's natural minimum ever grows past
-        # the left column's fixed total (e.g. a future addition of more
-        # controls there), QSplitter forces the left column taller too -
-        # without a stretch to claim that extra space, it would have to
-        # come from inside one of the fixed cards above instead of
-        # showing up here, as plain background below CONTROLS.
-        left.addStretch(1)
+        # CONTROLS now grows to fill leftover height the same way CONVERSION
+        # does (see conv.body.addStretch(1) further down): the stretch lives
+        # *inside* the card's own body layout, and the card itself gets
+        # stretch factor 1 in left.addWidget() below. That way its white
+        # background - not plain page background - is what fills any gap
+        # between its natural content and the shared splitter height, so
+        # CONTROLS' bottom edge tracks CONVERSION's bottom edge exactly
+        # instead of drifting apart whenever one side's natural content
+        # height changes relative to the other's (which is what used to
+        # happen here: CONTROLS was fixed-height with an external spacer
+        # absorbing the gap as bare background, so any growth on the
+        # CONVERSION side - e.g. adding new settings there - just made that
+        # gap bigger and more visible instead of both cards staying level).
+        controls.body.addStretch(1)
+        left.addWidget(controls, 1)
 
         # ---- CONVERSION ----
-        self.conv_card = conv = Card("CONVERSION")
+        self.conv_card = conv = Card("Conversion")
         conv.body.addWidget(QLabel("Backend"))
         self.backend_combo = QComboBox()
         self.backend_combo.addItems(["FFmpeg", "HandBrake"])
@@ -1429,7 +1765,7 @@ class MainWindow(QWidget):
         # signal for this one thing.
         self.encoder_combo.currentTextChanged.connect(lambda _t: self._update_quality_range())
 
-        self.pro_mode_chk = QCheckBox("Pro mode")
+        self.pro_mode_chk = ToggleSwitch("Pro mode")
         self.pro_mode_chk.toggled.connect(self.toggle_pro_mode)
         conv.body.addWidget(self.pro_mode_chk)
         pro_note = QLabel("Full CRF range, extra tone-mapping curves, brightness trim.")
@@ -1437,7 +1773,7 @@ class MainWindow(QWidget):
         set_role(pro_note, "muted")
         conv.body.addWidget(pro_note)
 
-        self.hwaccel_chk = QCheckBox("Hardware-accelerated decode")
+        self.hwaccel_chk = ToggleSwitch("Hardware-accelerated decode")
         conv.body.addWidget(self.hwaccel_chk)
         self.hwaccel_note = QLabel("")
         self.hwaccel_note.setWordWrap(True)
@@ -1451,11 +1787,12 @@ class MainWindow(QWidget):
         self.quality_spin.setValue(18)
         self.quality_spin.setFixedWidth(SPIN_WIDTH)
         self.quality_slider = QSlider(Qt.Orientation.Horizontal)
+        self.quality_slider.setFixedHeight(26)
         self.quality_slider.setRange(14, 28)
         self.quality_slider.setValue(18)
         self.quality_spin.valueChanged.connect(self.quality_slider.setValue)
         self.quality_slider.valueChanged.connect(self.quality_spin.setValue)
-        qf.addWidget(self.quality_spin)
+        qf.addWidget(make_stepper(self.quality_spin))
         qf.addWidget(self.quality_slider, 1)
         conv.body.addLayout(qf)
 
@@ -1472,6 +1809,7 @@ class MainWindow(QWidget):
         self.brightness_spin.setValue(0)
         self.brightness_spin.setFixedWidth(SPIN_WIDTH)
         self.brightness_slider = QSlider(Qt.Orientation.Horizontal)
+        self.brightness_slider.setFixedHeight(26)
         self.brightness_slider.setRange(-20, 20)
         self.brightness_slider.setValue(0)
         self.brightness_spin.valueChanged.connect(self.brightness_slider.setValue)
@@ -1480,7 +1818,7 @@ class MainWindow(QWidget):
         self.brightness_label.setEnabled(False)
         self.brightness_spin.setEnabled(False)
         self.brightness_slider.setEnabled(False)
-        bf.addWidget(self.brightness_spin)
+        bf.addWidget(make_stepper(self.brightness_spin))
         bf.addWidget(self.brightness_slider, 1)
         conv.body.addLayout(bf)
 
@@ -1488,6 +1826,32 @@ class MainWindow(QWidget):
         self.brightness_backend_note.setWordWrap(True)
         set_role(self.brightness_backend_note, "muted")
         conv.body.addWidget(self.brightness_backend_note)
+
+        self.saturation_label = QLabel("Saturation trim (-20 to +20, 0 = off)")
+        conv.body.addWidget(self.saturation_label)
+        sf = QHBoxLayout()
+        self.saturation_spin = QSpinBox()
+        self.saturation_spin.setRange(-20, 20)
+        self.saturation_spin.setValue(0)
+        self.saturation_spin.setFixedWidth(SPIN_WIDTH)
+        self.saturation_slider = QSlider(Qt.Orientation.Horizontal)
+        self.saturation_slider.setFixedHeight(26)
+        self.saturation_slider.setRange(-20, 20)
+        self.saturation_slider.setValue(0)
+        self.saturation_spin.valueChanged.connect(self.saturation_slider.setValue)
+        self.saturation_slider.valueChanged.connect(self.saturation_spin.setValue)
+        self.saturation_spin.valueChanged.connect(self._schedule_frame_preview)
+        self.saturation_label.setEnabled(False)
+        self.saturation_spin.setEnabled(False)
+        self.saturation_slider.setEnabled(False)
+        sf.addWidget(make_stepper(self.saturation_spin))
+        sf.addWidget(self.saturation_slider, 1)
+        conv.body.addLayout(sf)
+
+        self.saturation_backend_note = QLabel("")
+        self.saturation_backend_note.setWordWrap(True)
+        set_role(self.saturation_backend_note, "muted")
+        conv.body.addWidget(self.saturation_backend_note)
 
         self.backend_combo.currentTextChanged.connect(lambda _t: self._update_brightness_availability())
         self._update_brightness_availability()
@@ -1508,16 +1872,26 @@ class MainWindow(QWidget):
         set_role(res_note, "muted")
         conv.body.addWidget(res_note)
 
+        conv.body.addWidget(QLabel("Container"))
+        self.container_combo = QComboBox()
+        self.container_combo.addItems(["MP4", "MKV"])
+        self.container_combo.currentTextChanged.connect(self._on_container_changed)
+        self.container_combo.setToolTip(
+            "MP4 \u2014 widest device/player support.\n"
+            "MKV \u2014 needed if the source has subtitle or audio tracks "
+            "(e.g. PGS, DTS) that MP4 can't hold when copied as-is."
+        )
+        conv.body.addWidget(self.container_combo)
+
         # Stretch goes here, between the settings fields and the two
         # bottom buttons, instead of after the buttons - that way the
         # buttons are pinned to the bottom edge of the CONVERSION card.
-        # See the matching comment on controls.body.addStretch(1) /
-        # left.addWidget(controls, 1) above: since QSplitter always forces
-        # both columns to the same height regardless of content, the
-        # leftover height has to go somewhere - putting it here, inside
-        # the card, keeps it looking intentional (Activity/Install sit at
-        # the bottom) instead of showing up as bare background below the
-        # card.
+        # CONTROLS (left column) now does the exact same thing with its
+        # own trailing content - see the comment on controls.body.addStretch(1)
+        # above - so both cards grow to fill the shared splitter height
+        # with their own background, and their bottom edges stay level
+        # with each other regardless of which side's natural content is
+        # currently taller.
         conv.body.addStretch(1)
 
         # Activity now lives right above the dependency button instead of
@@ -1686,11 +2060,6 @@ class MainWindow(QWidget):
             unit = "GB" if size_gb >= 0.1 else "MB"
             size_val = size_gb if unit == "GB" else size_gb * 1024
             text += f" \u2192 ~{size_val:.1f} {unit} for this source"
-        is_hb_hw = (self.backend_combo.currentText().startswith("HandBrake")
-                    and not v.startswith("CPU"))
-        caveat = ("HandBrake's hardware-encoder quality scale isn't directly "
-                  "comparable to CRF, so this is even rougher than usual. " if is_hb_hw else "")
-        text += f". {caveat}Rough guide only \u2014 actual bitrate depends heavily on content complexity."
         self.bitrate_label.setText(text)
 
     # ---- pro mode --------------------------------------------------
@@ -1739,23 +2108,31 @@ class MainWindow(QWidget):
         self.hwaccel_note.setText(text)
 
     def _update_brightness_availability(self):
-        # HandBrakeCLI has no equivalent of ffmpeg's eq=brightness filter, so
-        # the setting is silently ignored by command_handbrake(). Rather than
-        # let the live preview (always rendered via ffmpeg) show an effect
-        # that never makes it into the actual HandBrake output, disable the
-        # control for that backend and explain why.
+        # HandBrakeCLI has no equivalent of ffmpeg's eq=brightness/saturation
+        # filter, so the settings are silently ignored by command_handbrake().
+        # Rather than let the live preview (always rendered via ffmpeg) show
+        # an effect that never makes it into the actual HandBrake output,
+        # disable both controls for that backend and explain why.
         using_hb = self.backend_combo.currentText().startswith("HandBrake")
         enabled = self.pro_mode_chk.isChecked() and not using_hb
         self.brightness_label.setEnabled(enabled)
         self.brightness_spin.setEnabled(enabled)
         self.brightness_slider.setEnabled(enabled)
+        self.saturation_label.setEnabled(enabled)
+        self.saturation_spin.setEnabled(enabled)
+        self.saturation_slider.setEnabled(enabled)
         if using_hb:
             self.brightness_spin.setValue(0)
+            self.saturation_spin.setValue(0)
             self.brightness_backend_note.setText(
+                "Not available on the HandBrake backend (no equivalent filter) "
+                "\u2014 switch to FFmpeg to use it.")
+            self.saturation_backend_note.setText(
                 "Not available on the HandBrake backend (no equivalent filter) "
                 "\u2014 switch to FFmpeg to use it.")
         else:
             self.brightness_backend_note.setText("")
+            self.saturation_backend_note.setText("")
 
     # ---- collapse toggles -----------------------------------------
     def toggle_activity(self):
@@ -2240,11 +2617,22 @@ Write-Output '[setup] Portable tools are ready.'
         if paths:
             self._add_files_to_queue(paths)
 
+    def _on_container_changed(self, label):
+        """Swaps the destination path's extension to match the chosen
+        container, but leaves everything else about the path alone -
+        including a name the person edited by hand - so switching MP4/MKV
+        never silently resets a custom output filename or folder."""
+        new_ext = ".mkv" if label == "MKV" else ".mp4"
+        current = Path(self.dst_edit.text()) if self.dst_edit.text() else None
+        if current is not None and current.suffix.lower() != new_ext:
+            self.dst_edit.setText(str(current.with_suffix(new_ext)))
+
     def _set_source(self, x, analyze=True):
         self.src_edit.setText(x)
         p = Path(x)
         folder = self.output_folder if self.output_folder and self.output_folder.is_dir() else p.parent
-        self.dst_edit.setText(str(folder / (p.stem + "_SDR.mp4")))
+        ext = ".mkv" if getattr(self, "container_combo", None) and self.container_combo.currentText() == "MKV" else ".mp4"
+        self.dst_edit.setText(str(folder / (p.stem + "_SDR" + ext)))
         self.kind = "unknown"
         self.duration = 0.0
         self.src_width = None
@@ -2534,10 +2922,21 @@ Write-Output '[setup] Portable tools are ready.'
         return f",scale=-2:{even(h)}:flags=lanczos"
 
     def brightness_args_ffmpeg(self):
-        val = self.brightness_spin.value() if self.pro_mode_chk.isChecked() else 0
-        if val == 0:
+        b_val = self.brightness_spin.value() if self.pro_mode_chk.isChecked() else 0
+        s_val = self.saturation_spin.value() if self.pro_mode_chk.isChecked() else 0
+        if b_val == 0 and s_val == 0:
             return ""
-        return f",eq=brightness={val / 20.0:.4f}"
+        parts = []
+        if b_val != 0:
+            parts.append(f"brightness={b_val / 20.0:.4f}")
+        if s_val != 0:
+            # eq=saturation is a multiplier around 1.0, not an offset like
+            # brightness - map the -20..+20 slider onto roughly 0.5x..1.5x
+            # so the low/high ends land on a clearly-visible but still
+            # believable de-tint / boost instead of clipping to grayscale
+            # or cartoonish oversaturation.
+            parts.append(f"saturation={1.0 + s_val / 40.0:.4f}")
+        return "," + "eq=" + ":".join(parts)
 
     def tonemap_lookup(self):
         all_curves = {**TONEMAP_BASE, **TONEMAP_PRO_GPU, **TONEMAP_PRO_GPU_ST2094, **TONEMAP_PRO_CPU}
@@ -2594,6 +2993,17 @@ Write-Output '[setup] Portable tools are ready.'
         vf += self.brightness_args_ffmpeg()
         return vf
 
+    def container_args_ffmpeg(self, path=None):
+        # -movflags +faststart moves the moov atom to the front for instant
+        # web/streaming playback start - an MP4/MOV muxer option only.
+        # FFmpeg errors out ("Unrecognized option") if it's passed while
+        # writing to an MKV (Matroska) container, so it has to be left off
+        # entirely rather than just being a harmless no-op there.
+        ext = Path(path if path is not None else self.dst_edit.text()).suffix.lower()
+        if ext in (".mp4", ".mov", ".m4v"):
+            return ["-movflags", "+faststart"]
+        return []
+
     def command_ffmpeg(self):
         e, opt = self.encode()
         fmt, _ = FFMPEG_BIT_DEPTH[self.bit_depth_combo.currentText()]
@@ -2602,16 +3012,17 @@ Write-Output '[setup] Portable tools are ready.'
             base += ["-hwaccel", "auto"]
         base += ["-progress", "pipe:1", "-nostats", "-i", self.src_edit.text()]
         vf = self.build_vf_chain(fmt)
+        container_args = self.container_args_ffmpeg()
         if self.preview_path is None:
             # No live preview requested (shouldn't normally happen for the
             # FFmpeg backend, but fall back to the plain single-output form).
             return base + ["-map", "0:v:0", *self._ffmpeg_track_args(), "-vf", vf, "-c:v", e, *opt,
                             "-pix_fmt", fmt, *self._ffmpeg_track_codec_args(),
-                            "-movflags", "+faststart", self.dst_edit.text()]
+                            *container_args, self.dst_edit.text()]
         main_out = [
             "-map", "[enc]", *self._ffmpeg_track_args(), "-c:v", e, *opt, "-pix_fmt", fmt,
             *self._ffmpeg_track_codec_args(),
-            "-movflags", "+faststart", self.dst_edit.text(),
+            *container_args, self.dst_edit.text(),
         ]
         # Split the tone-mapped output: full-res branch goes to the encoder,
         # a low-fps branch continuously overwrites a JPEG the GUI polls for
@@ -3104,7 +3515,7 @@ Write-Output '[setup] Portable tools are ready.'
             cmd += ["-hwaccel", "auto"]
         cmd += ["-ss", f"{seek:.2f}", "-i", src, "-t", "5", "-vf", vf,
                 "-c:v", e, *opt, "-pix_fmt", fmt, "-c:a", "copy",
-                "-movflags", "+faststart", str(out_path)]
+                *self.container_args_ffmpeg(out_path), str(out_path)]
         return cmd
 
     def _refresh_preview_meta_display(self):
@@ -3382,6 +3793,24 @@ Write-Output '[setup] Portable tools are ready.'
             self.proc.kill()
 
     def eventFilter(self, obj, event):
+        et = event.type()
+        # Custom tooltip (see _AppToolTip) - installed on the whole
+        # QApplication so it catches every widget's existing setToolTip()
+        # text without touching those call sites. Swallowing QEvent.ToolTip
+        # here is what stops Qt's own (black-on-this-machine) tooltip from
+        # ever appearing.
+        if et == QEvent.Type.ToolTip:
+            text = obj.toolTip() if isinstance(obj, QWidget) else ""
+            if text:
+                self._tooltip.setText(text)
+                self._tooltip.adjustSize()
+                self._tooltip.move(event.globalPos() + QPoint(14, 20))
+                self._tooltip.show()
+            else:
+                self._tooltip.hide()
+            return True
+        if et in (QEvent.Type.Leave, QEvent.Type.MouseButtonPress, QEvent.Type.Wheel):
+            self._tooltip.hide()
         # Keeps the displayed preview frame scaled to whatever space it
         # currently has - not just on the next poll/render tick, but
         # immediately on any resize. This matters more than a plain
@@ -3401,8 +3830,9 @@ Write-Output '[setup] Portable tools are ready.'
         # resizes it automatically when the splitter is dragged or the
         # window resized - it has to be matched to the viewport's size by
         # hand on every viewport resize.
-        if obj is self.queue_list.viewport() and event.type() == QEvent.Type.Resize:
-            self.queue_hint_label.setGeometry(self.queue_list.viewport().rect())
+        queue_list = getattr(self, "queue_list", None)
+        if queue_list is not None and obj is queue_list.viewport() and event.type() == QEvent.Type.Resize:
+            self.queue_hint_label.setGeometry(queue_list.viewport().rect())
         return super().eventFilter(obj, event)
 
     def _update_queue_hint(self, *args):
@@ -3476,6 +3906,15 @@ def install_excepthook(win):
 
 def main():
     app = QApplication(sys.argv)
+    # Force Fusion instead of leaving Qt to pick whatever native style is
+    # available (windowsvista/windows11 on Windows, etc.). Fusion is a
+    # QStyle Qt fully implements itself, so custom QSS - especially the
+    # QSlider groove/sub-page/add-page split used for the quality/brightness
+    # sliders - paints exactly as designed. Native styles partially ignore
+    # that QSS and fall back to their own slider chrome, which is what
+    # produced the misaligned/overlapping slider look on Windows.
+    app.setStyle("Fusion")
+    app.setStyle(NoMenuStylePopupStyle(app.style()))
     icon = load_app_icon()
     if not icon.isNull():
         app.setWindowIcon(icon)
