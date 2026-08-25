@@ -136,7 +136,7 @@ will silently break it into separate, broken commands — `cmd` doesn't
 understand `\` as a line continuation):
 
 ```bat
-python -m PyInstaller --noconfirm --windowed --onefile --name "HDR-to-SDR-Converter" --icon icon.ico --add-data "icon.ico;." --add-data "icons;icons" hdr_to_sdr_gui_qt.py
+python -m PyInstaller --noconfirm --windowed --onefile --name "HDR-to-SDR-Video-Converter" --icon icon.ico --add-data "icon.ico;." --add-data "icons;icons" --add-data "i18n;i18n" hdr_to_sdr_gui_qt.py
 ```
 
 `python -m PyInstaller` (rather than bare `pyinstaller`) is deliberate: pip
@@ -144,16 +144,18 @@ often installs the `pyinstaller` console script into a `Scripts\` folder
 that isn't on your `PATH`, which gives a `'pyinstaller' is not recognized`
 error even though the package installed fine. `python -m PyInstaller` runs
 it as a module instead, so it works as long as `python` itself is on `PATH`
-— no separate PATH fix needed.
+— no separate PATH fix needed. `pyinstaller` on its own works fine too as
+long as its console script actually is on your `PATH`.
 
 If you'd rather split it across multiple lines for readability, use `^` (not
 `\`) as the line-continuation character in `cmd.exe`:
 
 ```bat
-python -m PyInstaller --noconfirm --windowed --onefile --name "HDR-to-SDR-Converter" ^
+python -m PyInstaller --noconfirm --windowed --onefile --name "HDR-to-SDR-Video-Converter" ^
   --icon icon.ico ^
   --add-data "icon.ico;." ^
   --add-data "icons;icons" ^
+  --add-data "i18n;i18n" ^
   hdr_to_sdr_gui_qt.py
 ```
 
