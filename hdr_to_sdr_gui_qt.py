@@ -16,6 +16,7 @@ produce two downloads.
 """
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import re
@@ -23,6 +24,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -35,7 +39,7 @@ from PySide6.QtWidgets import (
     QSpinBox, QSlider, QProgressBar, QTextEdit, QGroupBox, QVBoxLayout, QHBoxLayout,
     QGridLayout, QFileDialog, QMessageBox, QFrame, QSplitter, QStackedWidget, QScrollArea,
     QDialog, QMenu, QToolButton, QListWidget, QSizePolicy, QGraphicsDropShadowEffect,
-    QAbstractButton, QProxyStyle, QStyle
+    QAbstractButton, QProxyStyle, QStyle, QSystemTrayIcon
 )
 
 try:
@@ -43,6 +47,75 @@ try:
     HAVE_PSUTIL = True
 except ImportError:
     HAVE_PSUTIL = False
+
+# ---- app version / update checking -----------------------------------------
+# GitHub repo this app checks for updates against.
+UPDATE_CHECK_REPO = "devgodys/HDR-to-SDR-Video-Converter"
+
+# Bump this to match the tag (e.g. "2.1" for the "v.2.1" release) right before
+# cutting a release, then set it back to None immediately after on the next
+# commit. Set to "2.2" now - the version this in-progress work is headed
+# for - so "Check for updates" already compares against it once tagged;
+# it just won't ever report itself as outdated before the matching v.2.2
+# tag actually exists on GitHub (fetch_latest_github_tag() would return an
+# older tag until then, and _tag_is_newer() only fires on a strictly newer
+# one).
+APP_VERSION = "2.2"
+
+
+def _parse_version_tag(tag):
+    """Turns a GitHub release tag into a tuple of ints for comparison.
+    Handles the repo's actual tag style ("v.2.1" - note the dot right
+    after "v", not just "v2.1") as well as the more common "v2.1.3" or
+    a bare "2.1", and ignores any non-numeric pre-release suffix like
+    "-beta". Returns an empty tuple for anything unparsable, which
+    always compares as "not newer" rather than raising."""
+    s = tag.strip()
+    if s[:1].lower() == "v":
+        s = s[1:]
+    s = s.lstrip(".")
+    s = re.split(r"[^0-9.]", s, maxsplit=1)[0]
+    parts = [p for p in s.split(".") if p != ""]
+    try:
+        return tuple(int(p) for p in parts)
+    except ValueError:
+        return ()
+
+
+def _tag_is_newer(remote_tag, local_version):
+    return _parse_version_tag(remote_tag) > _parse_version_tag(local_version)
+
+
+def fetch_latest_github_tag(owner_repo, timeout=5):
+    """Resolves owner/repo's "latest release" tag from the plain HTTP
+    redirect GitHub's web UI itself issues for .../releases/latest ->
+    .../releases/tag/<tag> - never touching api.github.com. Unlike an
+    api.github.com call, a plain github.com page redirect is not subject
+    to the 60-requests/hour unauthenticated API rate limit, so this can
+    be re-run as often as the user clicks "Check for updates" without
+    ever risking a 403. Returns None on any network hiccup, unexpected
+    response, or parse failure - a failed update check should never be
+    treated as "no update available", nor should it raise and interrupt
+    whatever else the button is doing."""
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None  # stop right at the redirect; don't follow it
+
+    opener = urllib.request.build_opener(NoRedirect)
+    req = urllib.request.Request(
+        f"https://github.com/{owner_repo}/releases/latest",
+        headers={"User-Agent": "HDR-to-SDR-Converter-update-check"})
+    try:
+        opener.open(req, timeout=timeout)
+        return None  # a 200 here means no redirect happened - unexpected
+    except urllib.error.HTTPError as e:
+        if e.code not in (301, 302, 303, 307, 308):
+            return None
+        location = e.headers.get("Location", "")
+        _, sep, tag = location.rstrip("/").rpartition("/tag/")
+        return urllib.parse.unquote(tag) if sep else None
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
 
 # ---- palette ---------------------------------------------------------------
 # Same two "compact utility card" themes as the Tkinter version, tuned
@@ -172,6 +245,50 @@ _HB_PROGRESS = re.compile(
 # already does for FFmpeg in check() below.
 _HB_ENCODER_LIST = re.compile(r"Select video encoder:\s*(.*?)(?:\n\s*-{1,2}\S|\Z)", re.S)
 
+# Substrings FFmpeg prints when a copied (-c:a copy / -c:s copy) track can't
+# actually be stored in an MP4/MOV container as-is - TrueHD/Atmos audio and
+# SubRip/PGS subtitles are the common real-world cases (see the "Container"
+# tooltip above). Matched case-insensitively against the raw log text so it
+# doesn't depend on FFmpeg's exact wording/punctuation across versions.
+_MP4_INCOMPATIBLE_TRACK_HINTS = (
+    "in mp4 support is experimental",
+    "add '-strict -2'",
+    "codec not currently supported in container",
+    "could not find tag for codec",
+)
+
+# Substrings FFmpeg/the vendor SDK print when a *hardware* encoder (NVENC,
+# AMF, QSV, VideoToolbox, ...) fails to open - almost always because the
+# installed GPU/driver doesn't actually support that codec (e.g. AV1 NVENC
+# needs an RTX 40-series+ card; older NVIDIA GPUs list av1_nvenc as a
+# compiled-in encoder but can't open it), not because anything about the
+# conversion settings is wrong.
+_HW_ENCODER_UNAVAILABLE_HINTS = (
+    "no capable devices found",
+    "opencodesessionex failed",
+    "driver does not support the required nvenc api version",
+    "error while opening encoder",
+    "cannot load nvcuda.dll",
+    "cannot load libcuda.so",
+)
+
+# Substrings printed when hardware *decode* (-hwaccel auto in FFmpeg, or
+# --enable-hw-decoding nvdec in HandBrakeCLI) fails to initialise for this
+# particular source/GPU/driver combination - distinct from the encode-side
+# hints above. The fix here is different too: turn the "Hardware-accelerated
+# decode" toggle off rather than switch encoders.
+_HW_DECODE_UNAVAILABLE_HINTS = (
+    "hwaccel initialisation returned error",
+    "failed to create decoder",
+    "failed setup for format",
+    "hardware accelerated decoding of this stream is unsupported",
+    "failed to get hw surface format",
+    "no decoder surfaces left",
+    "cannot open the hardware device",
+    "cuvidcreatedecoder failed",
+    "cuviddecodepicture failed",
+)
+
 # label -> target output height, or None for "don't scale". Deliberately
 # height-only, not a fixed W*H pair: forcing an exact width AND height (the
 # old behavior) stretches/distorts any source that isn't 16:9. Scaling to a
@@ -193,19 +310,28 @@ RESOLUTIONS = {
 # `tonemap` avfilter's values, and - confirmed against HandBrake's own
 # libhb/colorspace.c - HandBrake's `--colorspace ...:tonemap=` runs that
 # exact same avfilter under the hood, so these work on both backends.
+#
+# Labels intentionally follow the same short "<Name> \u00b7 <engine> tonemap"
+# shape for both GPU and CPU curves - the GPU ones used to carry a long
+# "GPU libplacebo/Vulkan (FFmpeg only)" suffix inline in the dropdown text,
+# which made every GPU entry dominate the combo box's natural width and
+# didn't match the terse CPU labels. That caveat now lives in TONEMAP_INFO's
+# tooltip text instead (same place every other curve's fine print lives),
+# shown on hover exactly like Hable/Reinhard/Mobius already are.
 TONEMAP_BASE = {
-    "BT.2390 \u00b7 GPU libplacebo/Vulkan (FFmpeg only)": ("gpu", "bt.2390"),
+    "BT.2390 \u00b7 GPU tonemap": ("gpu", "bt.2390"),
+    "Spline \u00b7 GPU tonemap": ("gpu", "spline"),
     "Hable \u00b7 CPU tonemap": ("cpu", "hable"),
     "Reinhard \u00b7 CPU tonemap": ("cpu", "reinhard"),
     "Mobius \u00b7 CPU tonemap": ("cpu", "mobius"),
 }
 TONEMAP_PRO_GPU = {
-    "BT.2446A \u00b7 GPU libplacebo/Vulkan (FFmpeg only)": ("gpu", "bt.2446a"),
-    "Auto \u00b7 GPU libplacebo/Vulkan (FFmpeg only)": ("gpu", "auto"),
+    "BT.2446A \u00b7 GPU tonemap": ("gpu", "bt.2446a"),
+    "Auto \u00b7 GPU tonemap": ("gpu", "auto"),
 }
 TONEMAP_PRO_GPU_ST2094 = {
-    "ST2094-40 (HDR10+) \u00b7 GPU libplacebo/Vulkan (FFmpeg only)": ("gpu", "st2094-40"),
-    "ST2094-10 \u00b7 GPU libplacebo/Vulkan (FFmpeg only)": ("gpu", "st2094-10"),
+    "ST2094-40 (HDR10+) \u00b7 GPU tonemap": ("gpu", "st2094-40"),
+    "ST2094-10 \u00b7 GPU tonemap": ("gpu", "st2094-10"),
 }
 TONEMAP_PRO_CPU = {
     "Linear \u00b7 CPU tonemap": ("cpu", "linear"),
@@ -219,30 +345,40 @@ TONEMAP_PRO_CPU = {
 # real downside (crushes highlights, needs metadata this source may lack),
 # say so rather than only listing what it's good at.
 TONEMAP_INFO = {
-    "BT.2390 \u00b7 GPU libplacebo/Vulkan (FFmpeg only)":
-        "The reference curve most professional HDR-to-SDR grades are built around. Good default - "
-        "balances highlight rolloff and midtone contrast without extra setup. Needs a Vulkan GPU.",
+    "BT.2390 \u00b7 GPU tonemap":
+        "The reference curve most professional HDR-to-SDR grades are built around. Balances highlight "
+        "rolloff and midtone contrast without extra setup. Runs on libplacebo/Vulkan, FFmpeg backend only "
+        "- needs an FFmpeg build with Vulkan support, and a GPU/driver that can run it.",
+    "Spline \u00b7 GPU tonemap":
+        "libplacebo's current default curve - a two-piece spline whose pivot point adapts to the source's "
+        "own scene brightness (using dynamic metadata when present). Tends to hold contrast a little more "
+        "consistently than BT.2390 across mixed-brightness scenes. Same Vulkan/FFmpeg-only requirement as "
+        "BT.2390 - worth comparing the two on a test clip if you're unsure which looks better.",
     "Hable \u00b7 CPU tonemap":
         "A filmic curve (originally from Uncharted 2) - smooth highlight rolloff, punchy midtones. "
-        "Solid default when BT.2390 isn't available, and the default HandBrake also uses internally.",
+        "Solid default when the GPU curves aren't available, and the default HandBrake also uses "
+        "internally. Runs on any FFmpeg build, no GPU required.",
     "Reinhard \u00b7 CPU tonemap":
         "Simple and fast, but tends to look flatter/lower-contrast than Hable or BT.2390 - a reasonable "
         "fallback, not usually the first choice.",
     "Mobius \u00b7 CPU tonemap":
         "Similar territory to Hable with a gentler shoulder into highlights - can hold onto slightly more "
         "detail in bright areas at the cost of a flatter overall look.",
-    "BT.2446A \u00b7 GPU libplacebo/Vulkan (FFmpeg only)":
+    "BT.2446A \u00b7 GPU tonemap":
         "ITU's method aimed at broadcast/TV mastering conventions rather than BT.2390's cinema-leaning "
-        "target - worth trying if BT.2390 looks a bit too contrasty for your source.",
-    "Auto \u00b7 GPU libplacebo/Vulkan (FFmpeg only)":
+        "target - worth trying if BT.2390 looks a bit too contrasty for your source. Same Vulkan/FFmpeg-"
+        "only requirement as BT.2390.",
+    "Auto \u00b7 GPU tonemap":
         "Lets libplacebo pick per-scene rather than applying one fixed curve throughout. Can adapt better "
-        "to sources with wildly inconsistent brightness, at the cost of predictability.",
-    "ST2094-40 (HDR10+) \u00b7 GPU libplacebo/Vulkan (FFmpeg only)":
+        "to sources with wildly inconsistent brightness, at the cost of predictability. Same Vulkan/"
+        "FFmpeg-only requirement as BT.2390.",
+    "ST2094-40 (HDR10+) \u00b7 GPU tonemap":
         "Uses the source's own HDR10+ dynamic metadata if present - most accurate option when that "
-        "metadata actually exists, but does nothing extra on a plain HDR10 source that lacks it.",
-    "ST2094-10 \u00b7 GPU libplacebo/Vulkan (FFmpeg only)":
+        "metadata actually exists, but does nothing extra on a plain HDR10 source that lacks it. Same "
+        "Vulkan/FFmpeg-only requirement as BT.2390.",
+    "ST2094-10 \u00b7 GPU tonemap":
         "Same idea as ST2094-40 but for the less common ST2094-10 metadata standard - only useful if your "
-        "source actually carries it.",
+        "source actually carries it. Same Vulkan/FFmpeg-only requirement as BT.2390.",
     "Linear \u00b7 CPU tonemap":
         "No highlight rolloff at all - bright areas clip hard rather than compress gracefully. Mainly "
         "useful for testing/comparison, rarely what you want for a final export.",
@@ -335,6 +471,16 @@ ENCODER_MAP = {
     "AMD AMF \u00b7 H.264": "h264_amf", "AMD AMF \u00b7 H.265": "hevc_amf",
     "Apple VideoToolbox \u00b7 H.264": "h264_videotoolbox",
     "Apple VideoToolbox \u00b7 H.265": "hevc_videotoolbox",
+    # Intel Quick Sync Video (QSV) - hardware encoding on Intel iGPUs
+    # (6th-gen/Skylake or newer) and Arc dGPUs. Very common on laptops that
+    # have neither a discrete NVIDIA nor AMD GPU, so this was a real gap:
+    # those machines previously had no hardware-encode option at all here
+    # and fell back to slow CPU x264/x265. FFmpeg encoder ids confirmed
+    # against `ffmpeg -encoders`; QSV needs Intel Media SDK/oneVPL runtime
+    # present, which self.encoders detection (see check()) already handles
+    # the same way it does for the other hardware encoders above - absent
+    # if the runtime isn't installed, present if it is.
+    "Intel QSV \u00b7 H.264": "h264_qsv", "Intel QSV \u00b7 H.265": "hevc_qsv",
     # AV1 is royalty-free (Alliance for Open Media Patent License) so it
     # carries none of HEVC's patent-pool baggage - no licensing blocker for
     # an MIT-licensed app. SVT-AV1 (libsvtav1) is BSD-2-Clause + Patent and
@@ -344,6 +490,10 @@ ENCODER_MAP = {
     "CPU \u00b7 AV1": "libsvtav1",
     "NVIDIA NVENC \u00b7 AV1": "av1_nvenc",
     "AMD AMF \u00b7 AV1": "av1_amf",
+    # Intel Xe/Arc QSV AV1 encoder, added in HandBrake 1.6.0 / has existed
+    # in FFmpeg's qsv wrapper since roughly the same era - needs an Xe- or
+    # Arc-generation Intel GPU (not older integrated graphics).
+    "Intel QSV \u00b7 AV1": "av1_qsv",
 }
 BIT_DEPTH_LABELS = ["8-bit (SDR standard)", "10-bit", "12-bit"]
 
@@ -360,11 +510,12 @@ FFMPEG_BIT_DEPTH = {
     "10-bit": ("yuv420p10le", {
         "CPU \u00b7 H.265", "NVIDIA NVENC \u00b7 H.265",
         "AMD AMF \u00b7 H.265", "Apple VideoToolbox \u00b7 H.265",
-        # All three AV1 encoders here handle 10-bit natively (AV1 itself
+        "Intel QSV \u00b7 H.265",
+        # All four AV1 encoders here handle 10-bit natively (AV1 itself
         # requires at least the encoder support 8/10-bit; none of these
-        # three builds does AV1 12-bit in practice, so - like H.264 above -
-        # AV1 simply has no 12-bit entry below).
-        "CPU \u00b7 AV1", "NVIDIA NVENC \u00b7 AV1", "AMD AMF \u00b7 AV1",
+        # builds does AV1 12-bit in practice, so - like H.264 above - AV1
+        # simply has no 12-bit entry below).
+        "CPU \u00b7 AV1", "NVIDIA NVENC \u00b7 AV1", "AMD AMF \u00b7 AV1", "Intel QSV \u00b7 AV1",
     }),
     "12-bit": ("yuv420p12le", {"CPU \u00b7 H.265"}),
 }
@@ -408,6 +559,13 @@ HB_ENCODER_IDS = {
     "AMD AMF \u00b7 H.265": {"8-bit (SDR standard)": "vce_h265", "10-bit": "vce_h265_10bit"},
     "Apple VideoToolbox \u00b7 H.264": {"8-bit (SDR standard)": "vt_h264"},
     "Apple VideoToolbox \u00b7 H.265": {"8-bit (SDR standard)": "vt_h265", "10-bit": "vt_h265_10bit"},
+    # Intel Quick Sync Video ids, added HandBrake 1.6.0 (H.264/H.265) - the
+    # 10-bit H.265 id shipped alongside it, confirmed in HandBrakeCLI
+    # --help output and multiple HandBrake issue-tracker logs. Needs
+    # 6th-gen/Skylake-or-newer Intel graphics (older iGPUs are explicitly
+    # unsupported per HandBrake's own release notes) or an Arc dGPU.
+    "Intel QSV \u00b7 H.264": {"8-bit (SDR standard)": "qsv_h264"},
+    "Intel QSV \u00b7 H.265": {"8-bit (SDR standard)": "qsv_h265", "10-bit": "qsv_h265_10bit"},
     # AV1 encoder ids added in HandBrake 1.6.0 (svt_av1/svt_av1_10bit, CPU)
     # and 1.7.0 (nvenc_av1 on RTX 40xx+, vce_av1 on RX 7000+/RDNA3),
     # confirmed present in `HandBrakeCLI --help` and HandBrake's release
@@ -419,10 +577,14 @@ HB_ENCODER_IDS = {
     # absent from self.hb_encoders and this dict already fails safe the
     # same way any other detected-but-missing id does (see
     # _allowed_encoder_labels below): that combo is just not offered,
-    # rather than erroring.
+    # rather than erroring. vce_av1_10bit specifically is now confirmed by
+    # HandBrake 1.11's release notes ("AMD VCN AV1 10-bit encoder").
     "CPU \u00b7 AV1": {"8-bit (SDR standard)": "svt_av1", "10-bit": "svt_av1_10bit"},
     "NVIDIA NVENC \u00b7 AV1": {"8-bit (SDR standard)": "nvenc_av1", "10-bit": "nvenc_av1_10bit"},
     "AMD AMF \u00b7 AV1": {"8-bit (SDR standard)": "vce_av1", "10-bit": "vce_av1_10bit"},
+    # Intel Xe/Arc QSV AV1, added HandBrake 1.6.0 alongside the H.264/H.265
+    # QSV ids above.
+    "Intel QSV \u00b7 AV1": {"8-bit (SDR standard)": "qsv_av1", "10-bit": "qsv_av1_10bit"},
 }
 # HandBrakeCLI's --encoder-profile isn't required to get 10/12-bit output -
 # the *_10bit/*_12bit encoder id alone already forces it - but setting it
@@ -961,13 +1123,49 @@ class MainWindow(QWidget):
         self.paused = False
         self.out_buf = ""
         self.block = {}
+        self._mp4_track_error_seen = False
         self.using_hb = False
+        self._hw_encoder_error_seen = False
+        self._hw_decode_error_seen = False
+        self._current_encoder_label = None
+        self._hwaccel_decode_on = False
+        # ---- resume-after-failure state (FFmpeg backend only) ----
+        # current_out_sec is already tracked separately below (used for the
+        # UI's position readout too) and is kept as an *absolute* position
+        # in source time even across resume segments - see
+        # _resume_progress_offset below and its use in ffmpeg_block_to_stats.
+        self._resume_seek_sec = 0.0          # -ss to inject for the *next* segment, 0 = none
+        self._resume_progress_offset = 0.0   # source-time offset the current segment started at
+        self._resume_output_override = None  # Path this run's main output actually goes to, or None
+        self._resume_parts = []              # already-encoded segment files, oldest first
+        self._resume_final_dst = None        # the true destination once a resume chain is active
+        self._concat_phase = False           # True while self.proc is the part-joining ffmpeg run
+        self._concat_list_path = None
         self.gpu_tool = shutil.which("nvidia-smi")
         self.handbrake_tool = exe("HandBrakeCLI")
         self.theme_name = "light"
         self._tooltip = _AppToolTip()
 
         self.build()
+        # ---- completion notifications (tray balloon) ------------------
+        # A tray icon is required for QSystemTrayIcon.showMessage() to
+        # actually surface a balloon/toast on every platform (Windows in
+        # particular ignores showMessage() from a hidden tray icon), so
+        # one is created and shown here rather than only lazily on first
+        # use. isSystemTrayAvailable() covers headless/minimal Linux
+        # setups where there's no tray to attach to at all.
+        self._tray = None
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            tray_icon = load_app_icon()
+            self._tray = QSystemTrayIcon(tray_icon if not tray_icon.isNull() else self.style().standardIcon(
+                QStyle.StandardPixmap.SP_ComputerIcon), self)
+            self._tray.setToolTip(self.tr("HDR to SDR Video Converter"))
+            # Clicking the balloon itself opens the output folder - the
+            # cheapest way to give the notification a useful action
+            # without a second custom-button API that showMessage()
+            # doesn't actually expose cross-platform.
+            self._tray.messageClicked.connect(self._open_output_folder)
+            self._tray.show()
         # Installed only now, after every widget referenced anywhere in
         # eventFilter() (queue_list, preview_label, ...) actually exists -
         # doing this earlier meant Qt's synchronous events fired *during*
@@ -1330,7 +1528,7 @@ class MainWindow(QWidget):
 
         self.language_button = QToolButton()
         self.language_button.setText("")
-        self.language_button.setToolTip("Interface language")
+        self.language_button.setToolTip(self.tr("Interface language"))
         self.language_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.language_menu = QMenu(self.language_button)
         self.language_button.setMenu(self.language_menu)
@@ -1341,7 +1539,7 @@ class MainWindow(QWidget):
 
         self.theme_btn = QToolButton()
         self.theme_btn.setText("")
-        self.theme_btn.setToolTip("Dark mode")
+        self.theme_btn.setToolTip(self.tr("Dark mode"))
         self.theme_btn.setFixedSize(38, 34)
         set_role(self.theme_btn, "theme")
         self.theme_btn.clicked.connect(self.toggle_theme)
@@ -1396,7 +1594,7 @@ class MainWindow(QWidget):
         # explicitly here so it doesn't silently depend on it.
         self.queue_list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.queue_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.queue_list.setToolTip("Videos waiting to be converted with the current settings.")
+        self.queue_list.setToolTip(self.tr("Videos waiting to be converted with the current settings."))
         files.body.addWidget(self.queue_list)
 
         # "Drop video files here..." used to be its own QLabel sitting
@@ -1425,12 +1623,29 @@ class MainWindow(QWidget):
         self.queue_add_btn = QPushButton("Add videos")
         self.queue_remove_btn = QPushButton("Remove")
         self.queue_start_btn = QPushButton("Start queue")
-        self.output_folder_btn = QPushButton("SDR output")
+        # This button used to be a plain "SDR output" folder picker, with
+        # a separate "History" button living in CONTROLS. The two are
+        # merged here: a left click behaves exactly like the old "SDR
+        # output" picker, unless a file has already been saved without
+        # the user picking a custom folder first, in which case a left
+        # click instead jumps straight to that saved file's folder - see
+        # _output_or_reveal() below. A right click (or the platform's
+        # context-menu key) opens the History dialog that used to need
+        # its own button - it doesn't fit as a third behaviour on a
+        # single left click, but a context menu was sitting right there
+        # unused.
+        self.output_folder_btn = QPushButton("Output")
         self.queue_add_btn.clicked.connect(self.browse_source)
         self.queue_remove_btn.clicked.connect(self._remove_queue_item)
         self.queue_start_btn.clicked.connect(self.start_queue)
-        self.output_folder_btn.clicked.connect(self.browse_output)
-        self.output_folder_btn.setToolTip("Choose one output folder for all queued files. Default: next to each source video.")
+        self.output_folder_btn.clicked.connect(self._output_or_reveal)
+        self.output_folder_btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.output_folder_btn.customContextMenuRequested.connect(
+            lambda pos: self._show_history_dialog())
+        self.output_folder_btn.setToolTip(self.tr(
+            "Choose one output folder for all queued files (default: next to each source video). "
+            "If you didn't set one and a conversion has already saved a file, this instead opens "
+            "the folder it was saved to. Right-click for conversion history."))
         for button in (self.queue_add_btn, self.queue_remove_btn, self.queue_start_btn, self.output_folder_btn):
             set_role(button, "panel-toggle")
             queue_row.addWidget(button)
@@ -1468,16 +1683,18 @@ class MainWindow(QWidget):
         self.analysis_scroll.setWidgetResizable(True)
         # Height comes from real font metrics for the 9pt "muted" role QSS
         # sets on this label (see `QLabel[role="muted"]` below), not a
-        # guessed constant. analyze() fills this label with up to 7 lines
-        # in the common case - headline, "Source file", the source-details
-        # line, "Recommended settings", and the three preset lines - so
-        # that's what's reserved here. The rare 8th line (a primaries
-        # mismatch warning) or an unusually long source-details line that
-        # wraps isn't worth reserving space for on every single analysis;
-        # it just scrolls instead, via the QScrollArea already wrapping
-        # this label.
+        # guessed constant. analyze() fills this label with up to ~10
+        # lines in the common HDR case - headline, "Source file", the
+        # source-details line, "HDR metadata" plus 1-3 detail lines
+        # (mastering range/MaxCLL-MaxFALL/DOVI profile - only shown for
+        # HDR/Dolby sources), "Recommended settings", and the three
+        # preset lines - so that's what's reserved here. The rare extra
+        # line (a primaries mismatch warning) or an unusually long
+        # source-details line that wraps isn't worth reserving space for
+        # on every single analysis; it just scrolls instead, via the
+        # QScrollArea already wrapping this label.
         analysis_fm = QFontMetrics(QFont(self.FONT, 9))
-        analysis_visible_lines = 7
+        analysis_visible_lines = 10
         self.analysis_scroll.setFixedHeight(analysis_fm.lineSpacing() * analysis_visible_lines + 8)
         self.analysis_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.analysis_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -1494,7 +1711,7 @@ class MainWindow(QWidget):
 
         self.analyze_btn = QPushButton("Analyze selected video")
         set_role(self.analyze_btn, "panel-toggle")
-        self.analyze_btn.setToolTip("Analyze the selected queue item before converting it.")
+        self.analyze_btn.setToolTip(self.tr("Analyze the selected queue item before converting it."))
         self.analyze_btn.clicked.connect(self.analyze_selected_queue_video)
         analysis.body.addWidget(self.analyze_btn)
 
@@ -1517,7 +1734,7 @@ class MainWindow(QWidget):
         ):
             set_role(b, "panel-toggle")
             b.setEnabled(False)
-            b.setToolTip(tip)
+            b.setToolTip(self.tr(tip))
             b.clicked.connect(fn)
             preset_row.addWidget(b)
         left.addWidget(analysis)
@@ -1567,13 +1784,15 @@ class MainWindow(QWidget):
         self.preview_expand_btn = QPushButton("View full size")
         set_role(self.preview_expand_btn, "panel-toggle")
         self.preview_expand_btn.setEnabled(False)
-        self.preview_expand_btn.setToolTip("View full size \u2014 open the current preview frame in a larger window.")
+        self.preview_expand_btn.setToolTip(self.tr(
+            "View full size \u2014 open the current preview frame in a larger window."))
         self.preview_expand_btn.clicked.connect(self.show_preview_fullscreen)
 
         self.preview_save_btn = QPushButton("Save frame")
         set_role(self.preview_save_btn, "panel-toggle")
         self.preview_save_btn.setEnabled(False)
-        self.preview_save_btn.setToolTip("Save frame \u2014 save the current preview frame to disk as an image.")
+        self.preview_save_btn.setToolTip(self.tr(
+            "Save frame \u2014 save the current preview frame to disk as an image."))
         self.preview_save_btn.clicked.connect(self.save_preview_frame)
 
         # The instant still-frame preview above is always rendered through
@@ -1586,22 +1805,39 @@ class MainWindow(QWidget):
         # instead, offer a cheap one-off: encode a short real clip with
         # today's settings through the actual backend that will be used,
         # and let the person play it back with their own player.
-        self.test_clip_btn = QPushButton("Render 5s test")
+        # Test-clip duration, in seconds. A separate small spinbox rather
+        # than folding it into the button label - the button label already
+        # doubles as the running/cancel state ("Render test clip" <->
+        # "Cancel test"), so a fixed duration control next to it is clearer
+        # than constantly rewriting the button text with a number baked in.
+        self.test_clip_duration_spin = QSpinBox()
+        self.test_clip_duration_spin.setRange(1, 300)
+        self.test_clip_duration_spin.setValue(5)
+        self.test_clip_duration_spin.setSuffix(" s")
+        self.test_clip_duration_spin.setFixedWidth(SPIN_WIDTH)
+        self.test_clip_duration_spin.setToolTip(self.tr(
+            "Test clip length, in seconds \u2014 how much of the source to render "
+            "for the test clip below."))
+
+        self.test_clip_btn = QPushButton("Render test clip")
         set_role(self.test_clip_btn, "panel-toggle")
-        self.test_clip_btn.setToolTip(
-            "Render 5s test clip \u2014 encode a short real clip from the middle of the "
+        self.test_clip_btn.setToolTip(self.tr(
+            "Render test clip \u2014 encode a short real clip from the middle of the "
             "source with the current settings, through the backend that will be used "
-            "for the full conversion, so you can check quality and motion first.")
+            "for the full conversion (including every audio/subtitle track, exactly "
+            "like the full conversion), so you can check quality, motion, and track "
+            "playback first."))
         self.test_clip_btn.clicked.connect(self._run_test_clip)
 
         self.test_clip_open_btn = QPushButton("Open test clip")
         set_role(self.test_clip_open_btn, "panel-toggle")
         self.test_clip_open_btn.setEnabled(False)
-        self.test_clip_open_btn.setToolTip(
-            "Open test clip \u2014 no test clip rendered yet. Turns green once one is ready to play.")
+        self.test_clip_open_btn.setToolTip(self.tr(
+            "Open test clip \u2014 no test clip rendered yet. Turns green once one is ready to play."))
         self.test_clip_open_btn.clicked.connect(self._open_test_clip)
 
-        for b in (self.preview_expand_btn, self.preview_save_btn, self.test_clip_btn, self.test_clip_open_btn):
+        for b in (self.preview_expand_btn, self.preview_save_btn,
+                  self.test_clip_duration_spin, self.test_clip_btn, self.test_clip_open_btn):
             btn_row.addWidget(b)
         preview.body.addLayout(btn_row)
 
@@ -1743,7 +1979,7 @@ class MainWindow(QWidget):
         self.method_combo = QComboBox()
         loosen_combo(self.method_combo, 14)
         self.method_combo.currentTextChanged.connect(
-            lambda text: self.method_combo.setToolTip(TONEMAP_INFO.get(text, "")))
+            lambda text: self.method_combo.setToolTip(self.tr(TONEMAP_INFO.get(text, ""))))
         self.method_combo.currentTextChanged.connect(self._schedule_frame_preview)
         conv.body.addWidget(self.method_combo)
         self.backend_combo.currentTextChanged.connect(self.refresh_method_choices)
@@ -1882,13 +2118,20 @@ class MainWindow(QWidget):
 
         conv.body.addWidget(QLabel("Container"))
         self.container_combo = QComboBox()
-        self.container_combo.addItems(["MP4", "MKV"])
+        # MKV first, so it's the default selection: it accepts every track
+        # type this app might copy through unchanged (TrueHD/Atmos, DTS,
+        # PGS, SRT, ...), while MP4 silently rejects several of them at mux
+        # time (see _MP4_INCOMPATIBLE_TRACK_HINTS below) - safer default for
+        # people who don't already know which tracks their source has.
+        self.container_combo.addItems(["MKV", "MP4"])
         self.container_combo.currentTextChanged.connect(self._on_container_changed)
-        self.container_combo.setToolTip(
-            "MP4 \u2014 widest device/player support.\n"
-            "MKV \u2014 needed if the source has subtitle or audio tracks "
-            "(e.g. PGS, DTS) that MP4 can't hold when copied as-is."
-        )
+        self.container_combo.setToolTip(self.tr(
+            "MKV \u2014 recommended default. Holds any audio/subtitle track "
+            "this app copies through (TrueHD/Atmos, DTS, PGS, SRT, ...) "
+            "without re-encoding it.\n"
+            "MP4 \u2014 widest device/player support, but will fail to mux "
+            "some of those same tracks unchanged \u2014 switch to MKV if that happens."
+        ))
         conv.body.addWidget(self.container_combo)
 
         # Stretch goes here, between the settings fields and the two
@@ -1914,18 +2157,20 @@ class MainWindow(QWidget):
         conv.body.addWidget(self.activity_btn)
 
         # "Install missing dependencies" and "Update FFmpeg" used to be two
-        # separate buttons. Both are Windows-only (winget / a PowerShell
-        # portable-download script), so they're merged into the single
-        # button Windows actually needs: install whatever's missing, or -
-        # if FFmpeg and HandBrakeCLI are both already present - offer to
-        # update FFmpeg instead of just saying "nothing to do".
+        # separate buttons, then merged into one Windows-only button that
+        # installs whatever's missing or offers to update FFmpeg. Renamed
+        # again to "Check for updates" now that it also checks the app's
+        # own GitHub releases page and can force-update HandBrakeCLI too -
+        # one button covering all three things a Windows user would
+        # otherwise have to remember to check separately.
         if sys.platform.startswith("win"):
-            self.install_btn = QPushButton("Install missing dependencies")
+            self.install_btn = QPushButton("Check for updates")
             set_role(self.install_btn, "panel-toggle")
-            self.install_btn.setToolTip(
-                "Installs FFmpeg/HandBrakeCLI if either is missing. If both are "
-                "already installed, offers to update FFmpeg instead.")
-            self.install_btn.clicked.connect(self.install_or_update_dependencies)
+            self.install_btn.setToolTip(self.tr(
+                "Checks for a newer app release, installs FFmpeg/HandBrakeCLI if either "
+                "is missing, and offers to update them to the latest portable build "
+                "if both are already installed."))
+            self.install_btn.clicked.connect(self.check_for_updates)
             conv.body.addWidget(self.install_btn)
 
         right.addWidget(conv, 1)
@@ -2167,6 +2412,140 @@ class MainWindow(QWidget):
         self.pbar.style().unpolish(self.pbar)
         self.pbar.style().polish(self.pbar)
 
+    # ---- output folder / completion notifications ----------------------
+    def _current_output_path(self):
+        """Best-guess path to the file conversion is writing (or last
+        wrote) to - the resumed-run final destination if a resume chain
+        is active, otherwise whatever's in the Destination field. Used
+        by both the "Open output folder" button and the tray
+        notification's click action, so they always agree."""
+        p = self._resume_final_dst or (Path(self.dst_edit.text()) if self.dst_edit.text() else None)
+        return p
+
+    def _open_output_folder(self):
+        p = self._current_output_path()
+        folder = p.parent if p else self.output_folder
+        if not folder or not Path(folder).is_dir():
+            QMessageBox.information(self, "Output folder", "No output folder to open yet \u2014 choose a destination first.")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+
+    def _notify_completion(self, ok, message):
+        """Cross-platform "conversion finished" notification via the
+        system tray balloon/toast. Silently does nothing when no tray is
+        available (self._tray is None) - the on-screen status label and
+        activity log already cover that case."""
+        if self._tray is None:
+            return
+        icon = QSystemTrayIcon.MessageIcon.Information if ok else QSystemTrayIcon.MessageIcon.Warning
+        self._tray.showMessage("HDR to SDR Video Converter", message, icon, 6000)
+
+    # ---- conversion history (JSON log next to the QSettings file) ------
+    def _history_file_path(self):
+        """Directory next to where this app's settings live, as a plain
+        JSON array file, one entry per finished conversion. Explicitly
+        asks QSettings for IniFormat rather than reusing the app's real
+        QSettings(...) instance as-is: on Windows that instance defaults
+        to the registry (NativeFormat), whose fileName() is a registry
+        key path, not anything on disk - IniFormat guarantees an actual
+        per-user config file/directory to sit next to on every OS, even
+        though the app's own settings are stored in the registry there."""
+        settings_path = Path(QSettings(
+            QSettings.Format.IniFormat, QSettings.Scope.UserScope,
+            "DevGodys", "HDR to SDR Video Converter").fileName())
+        return settings_path.parent / "conversion_history.json"
+
+    def _load_history(self):
+        try:
+            with open(self._history_file_path(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, list) else []
+        except (OSError, ValueError):
+            return []
+
+    def _append_history_entry(self, source, destination, status, kind):
+        """Best-effort append-and-trim - a history log is a convenience,
+        not something a write failure (permissions, full disk, a
+        corrupted existing file) should ever surface as an error dialog
+        over. Trimmed to the most recent 200 entries so the file doesn't
+        grow without bound over months of use."""
+        entry = {
+            "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+            "source": str(source) if source else "",
+            "destination": str(destination) if destination else "",
+            "status": status,  # "done" | "failed" | "stopped"
+            "kind": kind,       # "hdr" | "dolby" | "sdr" | "unknown"
+        }
+        try:
+            history = self._load_history()
+            history.append(entry)
+            history = history[-200:]
+            path = self._history_file_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(history, f, indent=2)
+        except OSError:
+            pass
+
+    def _show_history_dialog(self):
+        history = list(reversed(self._load_history()))
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Conversion history")
+        dlg.resize(640, 420)
+        layout = QVBoxLayout(dlg)
+        if not history:
+            layout.addWidget(QLabel("No conversions recorded yet."))
+        else:
+            listw = QListWidget()
+            status_labels = {"done": "\u2713 Done", "failed": "\u2717 Failed", "stopped": "\u25a0 Stopped"}
+            for entry in history:
+                name = Path(entry.get("source", "")).name or "(unknown source)"
+                when = entry.get("timestamp", "")
+                status_txt = status_labels.get(entry.get("status"), entry.get("status", ""))
+                kind_txt = {"hdr": "HDR10", "dolby": "Dolby Vision", "sdr": "SDR"}.get(entry.get("kind"), "")
+                label = f"{status_txt} \u00b7 {when} \u00b7 {name}"
+                if kind_txt:
+                    label += f" \u00b7 {kind_txt}"
+                listw.addItem(label)
+            layout.addWidget(listw)
+
+            def open_selected_folder():
+                row = listw.currentRow()
+                if row < 0:
+                    return
+                dest = history[row].get("destination")
+                folder = Path(dest).parent if dest else None
+                if folder and folder.is_dir():
+                    QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+                else:
+                    QMessageBox.information(dlg, "Output folder", "That entry's output folder isn't available anymore.")
+
+            listw.itemDoubleClicked.connect(lambda _item: open_selected_folder())
+            btn_row = QHBoxLayout()
+            open_btn = QPushButton("Open output folder")
+            open_btn.clicked.connect(open_selected_folder)
+            clear_btn = QPushButton("Clear history")
+
+            def clear_history():
+                confirm = QMessageBox.question(
+                    dlg, "Clear history", "Remove all recorded conversion history? This can't be undone.")
+                if confirm == QMessageBox.StandardButton.Yes:
+                    try:
+                        self._history_file_path().unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    dlg.close()
+
+            clear_btn.clicked.connect(clear_history)
+            btn_row.addWidget(open_btn)
+            btn_row.addStretch(1)
+            btn_row.addWidget(clear_btn)
+            layout.addLayout(btn_row)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.close)
+        layout.addWidget(close_btn)
+        dlg.exec()
+
     def update_run_controls(self):
         running = self.proc is not None
         self.go_btn.setEnabled(not running)
@@ -2269,7 +2648,8 @@ class MainWindow(QWidget):
         # avfilter, not libplacebo, so it can never offer these regardless of
         # what this machine's FFmpeg build supports.
         if not using_hb and self.has_bt2390:
-            values.append("BT.2390 \u00b7 GPU libplacebo/Vulkan (FFmpeg only)")
+            values.append("BT.2390 \u00b7 GPU tonemap")
+            values.append("Spline \u00b7 GPU tonemap")
             if self.pro_mode_chk.isChecked():
                 values += list(TONEMAP_PRO_GPU)
                 if self.has_st2094:
@@ -2294,9 +2674,9 @@ class MainWindow(QWidget):
         for i, v in enumerate(values):
             info = TONEMAP_INFO.get(v)
             if info:
-                self.method_combo.setItemData(i, info, Qt.ItemDataRole.ToolTipRole)
+                self.method_combo.setItemData(i, self.tr(info), Qt.ItemDataRole.ToolTipRole)
         self.method_combo.blockSignals(False)
-        self.method_combo.setToolTip(TONEMAP_INFO.get(self.method_combo.currentText(), ""))
+        self.method_combo.setToolTip(self.tr(TONEMAP_INFO.get(self.method_combo.currentText(), "")))
         if current in values:
             self.method_combo.setCurrentText(current)
         elif values:
@@ -2373,25 +2753,65 @@ class MainWindow(QWidget):
         self.caps_summary = "\n".join(lines)
 
     # ---- one-click dependency setup (Windows / winget) -----------------
-    def install_or_update_dependencies(self):
-        """Single entry point for the merged "Install missing dependencies"
-        button: install whatever's missing, or - if FFmpeg and HandBrakeCLI
-        are both already present - offer to update FFmpeg instead of just
-        telling the user there's nothing to install."""
+    def check_for_updates(self):
+        """Single entry point for the "Check for updates" button: reports
+        whether a newer app release exists, installs FFmpeg/HandBrakeCLI
+        if either is missing, or - if both are already present - offers
+        to update either or both to their latest portable build. Folding
+        all three checks (app, FFmpeg, HandBrakeCLI) into one click means
+        a Windows user only has one button to remember to press."""
         if self.proc is not None or getattr(self, "_setup_proc", None) is not None:
             QMessageBox.information(self, "Busy", "Finish or stop the current conversion/setup first.")
             return
+        self._report_app_update_status()
         if not exe("ffmpeg") or not self.handbrake_tool:
             self.start_dependency_setup()
             return
-        if QMessageBox.question(
-                self, "Already installed",
-                "FFmpeg and HandBrakeCLI are already installed. Update FFmpeg to the "
-                "latest version now?") == QMessageBox.StandardButton.Yes:
-            # A portable copy is deliberately updated in the app's own
-            # folder: it never overwrites a user-managed system FFmpeg
-            # installation.
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Already installed")
+        msg.setText("FFmpeg and HandBrakeCLI are already installed. Update either to the latest portable build?")
+        ffmpeg_btn = msg.addButton("Update FFmpeg", QMessageBox.ButtonRole.AcceptRole)
+        hb_btn = msg.addButton("Update HandBrakeCLI", QMessageBox.ButtonRole.AcceptRole)
+        both_btn = msg.addButton("Update both", QMessageBox.ButtonRole.AcceptRole)
+        msg.addButton("Not now", QMessageBox.ButtonRole.RejectRole)
+        msg.exec()
+        clicked = msg.clickedButton()
+        # A portable copy is deliberately updated in the app's own folder:
+        # it never overwrites a user-managed system FFmpeg/HandBrakeCLI
+        # installation, whether that install originally came from winget
+        # or from this same portable-download path.
+        if clicked is both_btn:
+            self._start_portable_dependency_setup(force_ffmpeg=True, force_handbrake=True)
+        elif clicked is ffmpeg_btn:
             self._start_portable_dependency_setup(force_ffmpeg=True)
+        elif clicked is hb_btn:
+            self._start_portable_dependency_setup(force_handbrake=True)
+
+    def _report_app_update_status(self):
+        """Checks the app's own GitHub releases page (see
+        fetch_latest_github_tag - a plain redirect, not the rate-limited
+        API) and writes the result to the Activity log; pops a dialog
+        only when there's actually a newer tagged release to point at,
+        so routine "you're current" / "can't reach GitHub" checks don't
+        interrupt anything. This app has no auto-update mechanism - this
+        is purely informational, linking to the Releases page to update
+        by hand."""
+        releases_url = f"https://github.com/{UPDATE_CHECK_REPO}/releases/latest"
+        tag = fetch_latest_github_tag(UPDATE_CHECK_REPO)
+        if tag is None:
+            self.write("[update check] Could not reach GitHub to check for app updates.\n")
+        elif APP_VERSION is None:
+            self.write(f"[update check] Running an unreleased development build \u2014 "
+                       f"latest published release is {tag}: {releases_url}\n")
+        elif _tag_is_newer(tag, APP_VERSION):
+            self.write(f"[update check] A newer version is available: {tag} "
+                       f"(you have {APP_VERSION}). {releases_url}\n")
+            QMessageBox.information(
+                self, "Update available",
+                f"Version {tag} is available \u2014 you're on {APP_VERSION}.\n\n"
+                f"Download it from the Releases page:\n{releases_url}")
+        else:
+            self.write(f"[update check] The app is up to date ({APP_VERSION}).\n")
 
     def start_dependency_setup(self):
         if self.proc is not None or getattr(self, "_setup_proc", None) is not None:
@@ -2462,12 +2882,12 @@ class MainWindow(QWidget):
             candidates.append(str(Path(local_app_data) / "Microsoft" / "WindowsApps" / "winget.exe"))
         return next((candidate for candidate in candidates if candidate and Path(candidate).is_file()), None)
 
-    def _start_portable_dependency_setup(self, force_ffmpeg=False):
+    def _start_portable_dependency_setup(self, force_ffmpeg=False, force_handbrake=False):
         """Download official portable tools when Windows Package Manager is unavailable."""
         todo = []
         if force_ffmpeg or not exe("ffmpeg"):
             todo.append("FFmpeg")
-        if not self.handbrake_tool:
+        if force_handbrake or not self.handbrake_tool:
             todo.append("HandBrakeCLI")
         if not todo:
             QMessageBox.information(self, "Nothing to install", "FFmpeg and HandBrakeCLI are already installed.")
@@ -2479,7 +2899,13 @@ class MainWindow(QWidget):
         self.write("\n[setup] winget is unavailable. Downloading portable " + " and ".join(todo)
                    + " to your local app-data folder…\n")
 
-        # FFmpeg is downloaded from Gyan's Windows builds. HandBrake's URL is
+        # FFmpeg is downloaded from BtbN's win64-gpl Windows builds (GitHub
+        # Actions autobuilds of FFmpeg master, zipped). This variant is built
+        # with --enable-vulkan --enable-libplacebo, so it actually supports the
+        # GPU/libplacebo tone-mapping curves (BT.2390, BT.2446A, ST2094-*) that
+        # this app offers - unlike Gyan's "essentials" build (previously used
+        # here), which omits libplacebo/vulkan entirely and silently downgrades
+        # every fresh install to CPU-only tonemap curves. HandBrake's URL is
         # resolved from its official GitHub release API so the app does not pin
         # users to an obsolete CLI version. The files are unpacked only under
         # %LOCALAPPDATA%, never into Program Files or system PATH.
@@ -2503,12 +2929,12 @@ function Install-ZipTool($url, $label, $exeName, $destinationName) {
 }
 
 if ($FORCE_FFMPEG -or -not (Test-Path (Join-Path $tools 'ffmpeg.exe'))) {
-    Install-ZipTool 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip' 'FFmpeg' 'ffmpeg.exe' 'ffmpeg'
+    Install-ZipTool 'https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip' 'FFmpeg' 'ffmpeg.exe' 'ffmpeg'
     $probe = Get-ChildItem -LiteralPath (Join-Path $work 'ffmpeg-expanded') -Recurse -Filter 'ffprobe.exe' | Select-Object -First 1
     if ($probe) { Copy-Item -LiteralPath $probe.FullName -Destination (Join-Path $tools 'ffprobe.exe') -Force }
 }
 
-if (-not (Test-Path (Join-Path $tools 'HandBrakeCLI.exe'))) {
+if ($FORCE_HANDBRAKE -or -not (Test-Path (Join-Path $tools 'HandBrakeCLI.exe'))) {
     $headers = @{ 'User-Agent' = 'HDR-to-SDR-Converter portable setup' }
     $release = Invoke-RestMethod -Headers $headers -Uri 'https://api.github.com/repos/HandBrake/HandBrake/releases/latest'
     $asset = $release.assets | Where-Object { $_.name -match '^HandBrakeCLI-.*-win-x86_64\.zip$' } | Select-Object -First 1
@@ -2517,7 +2943,8 @@ if (-not (Test-Path (Join-Path $tools 'HandBrakeCLI.exe'))) {
 }
 
 Write-Output '[setup] Portable tools are ready.'
-'''.replace("$FORCE_FFMPEG", "$true" if force_ffmpeg else "$false")
+'''.replace("$FORCE_FFMPEG", "$true" if force_ffmpeg else "$false") \
+   .replace("$FORCE_HANDBRAKE", "$true" if force_handbrake else "$false")
         p = QProcess(self)
         p.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         p.readyReadStandardOutput.connect(lambda p=p: self.write(
@@ -2590,8 +3017,16 @@ Write-Output '[setup] Portable tools are ready.'
 
     def _start_next_queue_item(self):
         if not self.queue_running or not self.queue_paths:
+            was_running = self.queue_running
             self.queue_running = False
             self.write("[queue] Finished.\n")
+            if was_running:
+                # Reached only when the queue actually drained on its own
+                # (every item succeeded) - a failed item sets
+                # queue_running False itself, in _on_finished/
+                # _on_concat_finished, and notifies from there instead,
+                # so this branch only ever fires for the success case.
+                self._notify_completion(True, "Queue finished \u2014 all files converted.")
             return
         path = self.queue_paths.pop(0)
         self.queue_list.takeItem(0)
@@ -2653,9 +3088,101 @@ Write-Output '[setup] Portable tools are ready.'
         folder = QFileDialog.getExistingDirectory(self, "Choose SDR output folder", initial)
         if folder:
             self.output_folder = Path(folder)
-            self.output_folder_btn.setText("SDR output: custom folder")
+            self.output_folder_btn.setText("Output: custom folder")
             if self.src_edit.text():
                 self._set_source(self.src_edit.text(), analyze=False)
+
+    def _output_or_reveal(self):
+        """Click handler for the merged Output/History button. Setting an
+        output folder ahead of time is still always available (clicking
+        just opens the picker) - but if the user never bothered to set
+        one and a conversion has already written a real file to the
+        default location, jump straight to that file's folder instead of
+        making them go looking for it."""
+        if not self.output_folder:
+            p = self._current_output_path()
+            if p and p.is_file():
+                self._open_output_folder()
+                return
+        self.browse_output()
+
+    # ---- HDR metadata extraction --------------------------------------
+    @staticmethod
+    def _ratio_to_float(value):
+        """ffprobe reports several fields (mastering-display luminance,
+        chromaticity coordinates) as "num/den" rational strings rather
+        than plain numbers - for the ones this app displays (min/max
+        mastering luminance) the ratio *is* directly the value in
+        cd/m\u00b2 (nits), no extra scaling needed. Returns None on
+        anything unparsable rather than raising, since a single odd
+        field shouldn't take down the whole analysis."""
+        try:
+            num, den = str(value).split("/")
+            return float(num) / float(den)
+        except (ValueError, ZeroDivisionError, AttributeError):
+            return None
+
+    def _hdr_metadata_details(self, s, raw):
+        """Pull the embedded static/dynamic HDR metadata - mastering
+        display luminance range, MaxCLL/MaxFALL, Dolby Vision profile,
+        HDR10+ dynamic metadata presence - out of the same ffprobe
+        stream dict/raw dump analyze() already has, entirely locally
+        (no network, no extra ffprobe call). This is a separate concern
+        from self.kind/note above: kind only looks at the transfer
+        function (PQ/HLG) to decide *whether* to tone-map, whereas this
+        answers "what HDR flavour does the file actually carry" for
+        display next to the preview. Returns a list of short plain-text
+        (no HTML) lines, always non-empty when called for an HDR/Dolby
+        source."""
+        side_data = s.get("side_data_list") or []
+        mastering = next((sd for sd in side_data
+                           if sd.get("side_data_type") == "Mastering display metadata"), None)
+        cll = next((sd for sd in side_data
+                    if sd.get("side_data_type") == "Content light level metadata"), None)
+        dovi = next((sd for sd in side_data
+                     if sd.get("side_data_type") == "DOVI configuration record"), None)
+        # HDR10+'s SMPTE2094-40 dynamic metadata lives in per-frame SEI,
+        # not this stream-level side_data_list (ffprobe only surfaces it
+        # there via -show_frames, which this app doesn't request) - so,
+        # same as the has_hdr10plus check in _optimal_note, presence is
+        # inferred from the lowercased raw stream dump instead.
+        has_hdr10plus = any(m in raw for m in ("smpte2094-40", "hdr10+", "hdr dynamic metadata"))
+
+        lines = []
+        if dovi:
+            profile = dovi.get("dv_profile")
+            level = dovi.get("dv_level")
+            layers = [name for name, flag in (("BL", dovi.get("bl_present_flag")),
+                                               ("EL", dovi.get("el_present_flag")),
+                                               ("RPU", dovi.get("rpu_present_flag"))) if flag]
+            profile_txt = f"profile {profile}.{level}" if profile is not None and level is not None else "profile unknown"
+            compat = dovi.get("dv_bl_signal_compatibility_id")
+            compat_txt = " \u00b7 HDR10-compatible base layer" if compat else ""
+            lines.append(f"Dolby Vision {profile_txt}{compat_txt}"
+                         f"{' \u00b7 ' + '/'.join(layers) if layers else ''}")
+        if has_hdr10plus:
+            lines.append("HDR10+ dynamic metadata (SMPTE 2094-40) present")
+        if mastering:
+            min_n = self._ratio_to_float(mastering.get("min_luminance"))
+            max_n = self._ratio_to_float(mastering.get("max_luminance"))
+            if max_n is not None:
+                if min_n is not None:
+                    lines.append(f"Mastering display: {min_n:.4g}\u2013{max_n:.0f} nits")
+                else:
+                    lines.append(f"Mastering display: up to {max_n:.0f} nits")
+        if cll:
+            max_content = cll.get("max_content")
+            max_average = cll.get("max_average")
+            parts = []
+            if max_content:
+                parts.append(f"MaxCLL {max_content} nits")
+            if max_average:
+                parts.append(f"MaxFALL {max_average} nits")
+            if parts:
+                lines.append(" \u00b7 ".join(parts))
+        if not lines:
+            lines.append("No embedded static/dynamic metadata \u2014 tone mapping relies on the transfer function only")
+        return lines
 
     # ---- analyze ----------------------------------------------------
     def analyze(self):
@@ -2728,7 +3255,15 @@ Write-Output '[setup] Portable tools are ready.'
             # and this goes on hover for anyone who wants the whole story,
             # the same show-compact/hover-for-detail pattern already used
             # for the tone-mapping dropdown.
-            self.analysis_label.setToolTip(f"{note} {cs_line}. Duration: {dur_note}. {rec}{warn}")
+            # Embedded HDR metadata (MaxCLL/MaxFALL, mastering display
+            # luminance range, Dolby Vision profile/level, HDR10+ dynamic
+            # metadata presence) - computed once here from the same
+            # ffprobe stream dict/raw dump already parsed above, and
+            # reused for both the hover tooltip and the on-screen lines
+            # below so the two never drift out of sync with each other.
+            hdr_meta_lines = self._hdr_metadata_details(s, raw) if self.kind in ("hdr", "dolby") else []
+            hdr_meta_tip = f" HDR metadata: {'; '.join(hdr_meta_lines)}." if hdr_meta_lines else ""
+            self.analysis_label.setToolTip(f"{note} {cs_line}. Duration: {dur_note}. {rec}{warn}{hdr_meta_tip}")
             t_col = THEMES[self.theme_name]
             headline = {"hdr": "HDR detected", "sdr": "SDR / Rec.709 detected", "dolby": "Dolby Vision detected"}[self.kind]
             headline_color = t_col["AMBER"] if self.kind == "dolby" else t_col["INDIGO"]
@@ -2740,6 +3275,10 @@ Write-Output '[setup] Portable tools are ready.'
             lines = [f"<b style='color:{headline_color}'>{headline}</b>"]
             lines.append(f"<b style='color:{muted}'>Source file</b>")
             lines.append(f"&nbsp;&nbsp;{src_short} \u00b7 {dur_short}")
+            if hdr_meta_lines:
+                lines.append(f"<b style='color:{muted}'>HDR metadata</b>")
+                for ml in hdr_meta_lines:
+                    lines.append(f"&nbsp;&nbsp;{ml}")
             lines.append(f"<b style='color:{muted}'>Recommended settings</b>")
             lines.append(f"&nbsp;&nbsp;<b>Optimal</b> \u2014 {self._optimal_note(self.kind, raw)}")
             lines.append(f"&nbsp;&nbsp;<b>Best quality</b> \u2014 {self._best_quality_note()}")
@@ -2802,6 +3341,7 @@ Write-Output '[setup] Portable tools are ready.'
             ("NVIDIA NVENC \u00b7 H.265", "hevc_nvenc"),
             ("AMD AMF \u00b7 H.265", "hevc_amf"),
             ("Apple VideoToolbox \u00b7 H.265", "hevc_videotoolbox"),
+            ("Intel QSV \u00b7 H.265", "hevc_qsv"),
         ]
         gpu_hit = next((label for label, enc_id in gpu_options if enc_id in self.encoders), None)
         if gpu_hit:
@@ -2819,9 +3359,9 @@ Write-Output '[setup] Portable tools are ready.'
         if kind != "dolby":
             has_hdr10plus = any(m in raw for m in ("smpte2094-40", "hdr10+", "hdr dynamic metadata"))
             if has_hdr10plus and self.has_bt2390 and self.has_st2094:
-                return "ST2094-40 (HDR10+) \u00b7 GPU libplacebo/Vulkan (FFmpeg only)", True
+                return "ST2094-40 (HDR10+) \u00b7 GPU tonemap", True
         if self.has_bt2390:
-            return "BT.2390 \u00b7 GPU libplacebo/Vulkan (FFmpeg only)", False
+            return "BT.2390 \u00b7 GPU tonemap", False
         return "Hable \u00b7 CPU tonemap", False
 
     def _select_curve(self, label, need_pro):
@@ -2863,6 +3403,7 @@ Write-Output '[setup] Portable tools are ready.'
             ("NVIDIA NVENC \u00b7 H.265", "hevc_nvenc"),
             ("AMD AMF \u00b7 H.265", "hevc_amf"),
             ("Apple VideoToolbox \u00b7 H.265", "hevc_videotoolbox"),
+            ("Intel QSV \u00b7 H.265", "hevc_qsv"),
         ]
         gpu_hit = next((label for label, enc_id in gpu_options if enc_id in self.encoders), None)
         target = gpu_hit if gpu_hit and self.encoder_combo.findText(gpu_hit) >= 0 else "CPU \u00b7 H.264"
@@ -2875,7 +3416,7 @@ Write-Output '[setup] Portable tools are ready.'
         # GPU tone-mapping is itself hardware-accelerated and cheap even
         # though it's not required for speed, so prefer it when available;
         # Hable is the lightest CPU curve otherwise.
-        label = "BT.2390 \u00b7 GPU libplacebo/Vulkan (FFmpeg only)" if self.has_bt2390 else "Hable \u00b7 CPU tonemap"
+        label = "BT.2390 \u00b7 GPU tonemap" if self.has_bt2390 else "Hable \u00b7 CPU tonemap"
         self._select_curve(label, False)
         self.write(f"[preset] Fast applied: {self.encoder_combo.currentText()}, {self.method_combo.currentText()}\n")
 
@@ -2910,6 +3451,7 @@ Write-Output '[setup] Portable tools are ready.'
             ("NVIDIA NVENC \u00b7 H.265", "hevc_nvenc"),
             ("AMD AMF \u00b7 H.265", "hevc_amf"),
             ("Apple VideoToolbox \u00b7 H.265", "hevc_videotoolbox"),
+            ("Intel QSV \u00b7 H.265", "hevc_qsv"),
         ]
         gpu_hit = next((label for label, enc_id in gpu_options if enc_id in self.encoders), None)
         if gpu_hit:
@@ -3015,22 +3557,35 @@ Write-Output '[setup] Portable tools are ready.'
     def command_ffmpeg(self):
         e, opt = self.encode()
         fmt, _ = FFMPEG_BIT_DEPTH[self.bit_depth_combo.currentText()]
+        dst = str(self._resume_output_override) if self._resume_output_override else self.dst_edit.text()
         base = [exe("ffmpeg"), "-hide_banner", "-y"]
         if self.hwaccel_chk.isChecked():
             base += ["-hwaccel", "auto"]
+        if self._resume_seek_sec > 0:
+            # Fast (input-side) seek to resume a previously interrupted run
+            # from roughly this point in the source. Placed before -i so
+            # FFmpeg seeks via keyframes instead of decoding+discarding
+            # every frame up to this point - much faster on a multi-hour
+            # source, at the cost of possibly landing a little before/after
+            # the exact requested timestamp. That's fine here: the caller
+            # already backs this off from the last known-good point by a
+            # safety margin (see _begin_resume), and the two segments get
+            # stitched back together with a plain stream-copy concat, not a
+            # frame-accurate cut.
+            base += ["-ss", f"{self._resume_seek_sec:.3f}"]
         base += ["-progress", "pipe:1", "-nostats", "-i", self.src_edit.text()]
         vf = self.build_vf_chain(fmt)
-        container_args = self.container_args_ffmpeg()
+        container_args = self.container_args_ffmpeg(dst)
         if self.preview_path is None:
             # No live preview requested (shouldn't normally happen for the
             # FFmpeg backend, but fall back to the plain single-output form).
             return base + ["-map", "0:v:0", *self._ffmpeg_track_args(), "-vf", vf, "-c:v", e, *opt,
                             "-pix_fmt", fmt, *self._ffmpeg_track_codec_args(),
-                            *container_args, self.dst_edit.text()]
+                            *container_args, dst]
         main_out = [
             "-map", "[enc]", *self._ffmpeg_track_args(), "-c:v", e, *opt, "-pix_fmt", fmt,
             *self._ffmpeg_track_codec_args(),
-            *container_args, self.dst_edit.text(),
+            *container_args, dst,
         ]
         # Split the tone-mapped output: full-res branch goes to the encoder,
         # a low-fps branch continuously overwrites a JPEG the GUI polls for
@@ -3106,7 +3661,19 @@ Write-Output '[setup] Portable tools are ready.'
         return ["-map", "0:a?", "-map", "0:s?"]
 
     def _ffmpeg_track_codec_args(self):
-        return ["-c:a", "copy", "-c:s", "copy"]
+        # -max_interleave_delta 0: without this, ffmpeg's muxer lets
+        # streams drift up to ~10s apart in interleaving order before
+        # forcing a flush. Subtitle packets are sparse (long gaps between
+        # lines), and with several audio tracks + subtitle tracks all
+        # copied through at once, that drift can leave a non-primary
+        # audio track's clusters written in a way that breaks seeking
+        # into the middle of that track - it plays fine from the very
+        # start of the file, but switching to it mid-playback (which is
+        # effectively a seek within that track) goes silent. Forcing 0
+        # disables the drift allowance and interleaves strictly by
+        # timestamp instead, which fixes this for MKV outputs and is a
+        # harmless no-op for MP4/MOV.
+        return ["-c:a", "copy", "-c:s", "copy", "-max_interleave_delta", "0"]
 
     # ---- run / control -------------------------------------------------
     def start(self):
@@ -3167,6 +3734,30 @@ Write-Output '[setup] Portable tools are ready.'
         self.using_hb = using_hb
         self.out_buf = ""
         self.block = {}
+        self._mp4_track_error_seen = False
+        self._hw_encoder_error_seen = False
+        self._hw_decode_error_seen = False
+        # encoder_combo is shared between the FFmpeg and HandBrakeCLI
+        # backends, so this is meaningful (and worth capturing) either way.
+        self._current_encoder_label = self.encoder_combo.currentText()
+        self._hwaccel_decode_on = self.hwaccel_chk.isChecked()
+        # A brand-new run (as opposed to _start_resume_segment continuing
+        # one) always starts a clean resume chain - if a previous attempt
+        # on this same item left orphaned "*.resume-partN*" files behind
+        # (e.g. the user picked "Start over" after a failed resume, or the
+        # app was closed mid-chain), get rid of them now rather than
+        # silently leaving stray multi-GB files next to the output.
+        for p in self._resume_parts:
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+        if self._resume_output_override is not None:
+            try:
+                self._resume_output_override.unlink(missing_ok=True)
+            except OSError:
+                pass
+        self._reset_resume_state()
 
         if using_hb:
             self.preview_path = None
@@ -3193,8 +3784,16 @@ Write-Output '[setup] Portable tools are ready.'
                     self, "Encoder unavailable",
                     f"This HandBrakeCLI build doesn't support the '{hb_enc_id}' encoder/profile.")
                 return
-        if self.side_tab != "activity":
-            self.toggle_activity()
+        self._launch(cmd)
+
+    def _launch(self, cmd):
+        """Shared QProcess launch tail for the main conversion, resume
+        segments, and the resume part-concat step - anything that needs to
+        run a command through the Activity log / progress machinery.
+        Deliberately does NOT auto-switch to the Activity tab anymore -
+        starting a conversion shouldn't yank the user's view away from
+        whatever panel they were on; they can still open Activity
+        themselves whenever they want to check the log."""
         self.write("$ " + subprocess.list2cmdline(cmd) + "\n")
         self.set_state("run", "Converting\u2026 0%")
 
@@ -3259,6 +3858,24 @@ Write-Output '[setup] Portable tools are ready.'
                 self._handle_line(line)
 
     def _handle_line(self, line):
+        low = line.lower()
+        # Container/track-copy failures are FFmpeg-specific (HandBrakeCLI
+        # transcodes/falls back instead of erroring the same way), so keep
+        # that check FFmpeg-only. The HW encode/decode hints below come from
+        # the underlying vendor libraries (NVENC/NVDEC/AMF/VideoToolbox)
+        # that both backends call into, so check those regardless of backend.
+        if not self.using_hb and not self._mp4_track_error_seen:
+            if any(hint in low for hint in _MP4_INCOMPATIBLE_TRACK_HINTS):
+                self._mp4_track_error_seen = True
+        if (not self._hw_encoder_error_seen
+                and self._current_encoder_label
+                and self._current_encoder_label.split(None, 1)[0] in ("NVIDIA", "AMD", "Apple")
+                and any(hint in low for hint in _HW_ENCODER_UNAVAILABLE_HINTS)):
+            self._hw_encoder_error_seen = True
+        if (not self._hw_decode_error_seen
+                and self._hwaccel_decode_on
+                and any(hint in low for hint in _HW_DECODE_UNAVAILABLE_HINTS)):
+            self._hw_decode_error_seen = True
         if self.using_hb:
             m = _HB_PROGRESS.search(line)
             if m:
@@ -3281,16 +3898,22 @@ Write-Output '[setup] Portable tools are ready.'
 
     def ffmpeg_block_to_stats(self, block):
         out_ms = parse_num(block.get("out_time_ms", ""))
+        # out_time_ms is relative to *this* ffmpeg process's own input
+        # timeline, which restarts at 0 whenever a resume segment applies
+        # "-ss" before "-i". _resume_progress_offset (0.0 for a normal,
+        # non-resumed run) shifts it back to an absolute position in the
+        # source so the progress bar/ETA/current_out_sec stay correct
+        # across a resume instead of restarting from 0%.
+        out_sec = out_ms / 1e6 + self._resume_progress_offset if out_ms is not None else None
         pct = None
-        if self.duration and out_ms is not None:
-            pct = min(99.9, out_ms / 1e6 / self.duration * 100)
+        if self.duration and out_sec is not None:
+            pct = min(99.9, out_sec / self.duration * 100)
         speed_x = parse_num(block.get("speed", ""))
         kbps = parse_num(block.get("bitrate", ""))
         mbps = kbps / 8000 if kbps is not None else None  # kbit/s -> MB/s
         eta_sec = None
         if pct is not None and speed_x and self.duration:
             eta_sec = self.duration * (100 - pct) / 100 / speed_x
-        out_sec = out_ms / 1e6 if out_ms is not None else None
         return {"pct": pct, "speed_x": speed_x, "mbps": mbps, "fps": parse_num(block.get("fps", "")),
                 "eta_sec": eta_sec, "out_sec": out_sec}
 
@@ -3321,7 +3944,11 @@ Write-Output '[setup] Portable tools are ready.'
             self.update_run_controls()
 
     def _on_finished(self, exit_code, exit_status):
+        if self._concat_phase:
+            self._on_concat_finished(exit_code, exit_status)
+            return
         was_stopping = self.stopping
+        active_path = self._resume_output_override or Path(self.dst_edit.text())
         if was_stopping:
             self.write("\nConversion stopped by user.\n")
             ok = False
@@ -3331,25 +3958,351 @@ Write-Output '[setup] Portable tools are ready.'
         else:
             self.write(f"\nConversion failed (exit code {exit_code}); see log.\n")
             ok = False
+            if (not self.using_hb and self._mp4_track_error_seen
+                    and active_path.suffix.lower() in (".mp4", ".mov", ".m4v")):
+                self.write(
+                    "[hint] This looks like an MP4/MOV container limitation, not a "
+                    "conversion error: some copied audio or subtitle track (e.g. "
+                    "TrueHD/Atmos, PGS, SRT) can't be muxed into MP4 unchanged. "
+                    "Switch the Container option to MKV and try again.\n")
+                QMessageBox.warning(
+                    self, "MP4 can't hold one of these tracks",
+                    "The conversion failed while writing the output file, not while "
+                    "tone-mapping the video.\n\n"
+                    "One of the audio or subtitle tracks being copied through "
+                    "unchanged (for example TrueHD/Atmos audio, or PGS/SRT "
+                    "subtitles) isn't something the MP4/MOV container can store "
+                    "as-is.\n\n"
+                    "Switch the Container option to MKV and run the conversion "
+                    "again \u2014 MKV accepts all of these track types unmodified.")
+            elif self._hw_encoder_error_seen:
+                label = self._current_encoder_label or "the selected hardware encoder"
+                backend_note = " (HandBrakeCLI)" if self.using_hb else ""
+                self.write(
+                    f"[hint] This looks like a GPU/driver limitation, not a conversion "
+                    f"error: '{label}'{backend_note} failed to open, which usually means "
+                    f"this GPU or its driver doesn't actually support that codec (e.g. AV1 "
+                    f"NVENC needs an RTX 40-series or newer card; AV1 AMF needs RDNA3). "
+                    f"Switch to a different encoder (a CPU encoder always works) and try "
+                    f"again.\n")
+                QMessageBox.warning(
+                    self, "Hardware encoder unavailable",
+                    f"The conversion failed while opening '{label}'{backend_note}, not "
+                    "while tone-mapping the video.\n\n"
+                    "This usually means the installed GPU or its driver doesn't "
+                    "actually support that codec, even though it's listed as available "
+                    "\u2014 for example, AV1 encoding over NVENC needs an RTX 40-series "
+                    "(or newer) card, and AV1 over AMD's AMF needs an RDNA3 card; older "
+                    "GPUs can't open those encoders even though they're offered in the "
+                    "dropdown.\n\n"
+                    "Pick a different encoder in the Encoder dropdown (a CPU encoder "
+                    "such as CPU \u00b7 H.265 always works, or try HEVC/H.264 on this "
+                    "GPU's own hardware encoder if it supports those) and run the "
+                    "conversion again.")
+            elif self._hw_decode_error_seen:
+                backend_note = "HandBrakeCLI's NVDEC decoding" if self.using_hb else "FFmpeg's hardware decode"
+                self.write(
+                    f"[hint] This looks like a GPU/driver limitation on the decode side, "
+                    f"not a conversion error: {backend_note} failed to initialise for "
+                    f"this source. Turn off \"Hardware-accelerated decode\" and try again "
+                    f"\u2014 software decoding always works, just slower.\n")
+                QMessageBox.warning(
+                    self, "Hardware decode unavailable",
+                    f"The conversion failed while setting up {backend_note} for this "
+                    "video, not while tone-mapping it.\n\n"
+                    "This usually means the GPU or its driver can't hardware-decode "
+                    "this particular stream (for example, some GPUs or drivers don't "
+                    "handle 10-bit HEVC with Dolby Vision layers over hardware decode "
+                    "even though they handle plain HEVC fine).\n\n"
+                    "Turn off the \"Hardware-accelerated decode\" toggle and run the "
+                    "conversion again \u2014 software decoding is slower but doesn't "
+                    "depend on GPU driver support.")
+        was_resume_segment = bool(self._resume_parts) or self._resume_final_dst is not None
         self.proc = None
         self.proc_psutil = None
         self.stopping = False
         self.paused = False
+
+        if ok and was_resume_segment:
+            # This process only encoded one segment of the source (from a
+            # previous resume point onward), not the whole file - stitch it
+            # onto the earlier part(s) instead of treating the item as done.
+            self._resume_parts.append(active_path)
+            self._resume_output_override = None
+            self._start_concat_phase()
+            return
+
         if ok:
             self.pbar.setValue(1000)
             self.set_state("done", "Done \u00b7 saved to output")
             self._validate_output(Path(self.dst_edit.text()))
+        elif not was_stopping and self._offer_resume(active_path):
+            return  # a new segment (or a fresh restart) was already launched
         elif was_stopping:
             self.set_state("idle", "Stopped")
         else:
             self.set_state("error", "Failed \u2014 see activity log")
+        self._append_history_entry(
+            self.src_edit.text(), active_path,
+            "done" if ok else ("stopped" if was_stopping else "failed"), self.kind)
         self.update_run_controls()
         if self.queue_running:
             if ok:
                 QTimer.singleShot(250, self._start_next_queue_item)
+            elif was_stopping:
+                # User pressed Stop mid-queue - not a failure, so don't
+                # notify or continue to the next item, but don't word it
+                # as a failed conversion either.
+                self.queue_running = False
+                self.write("[queue] Stopped by user.\n")
             else:
                 self.queue_running = False
                 self.write("[queue] Stopped because one item failed.\n")
+                self._notify_completion(False, f"Queue stopped: {active_path.name} failed to convert.")
+        elif not was_stopping:
+            # Standalone (non-queue) run - this is the only place its
+            # completion is ever reported, so notify right here rather
+            # than waiting for a "queue finished" point that doesn't
+            # exist for it. Queue completions are notified once, from
+            # _start_next_queue_item(), when the queue actually drains.
+            self._notify_completion(ok, f"{'Finished converting' if ok else 'Conversion failed for'} {active_path.name}.")
+
+    # ---- resume-after-failure (FFmpeg backend only) ---------------------
+    def _reset_resume_state(self):
+        self._resume_seek_sec = 0.0
+        self._resume_progress_offset = 0.0
+        self._resume_output_override = None
+        self._resume_parts = []
+        self._resume_final_dst = None
+        self._concat_phase = False
+        self._concat_list_path = None
+
+    def _probe_duration(self, path):
+        """Real muxed duration of an existing file, via ffprobe - used in
+        preference to the -progress estimate when deciding where to resume
+        from, since -progress can be a little ahead of what actually made
+        it into the container before the process died."""
+        probe = exe("ffprobe")
+        if not probe:
+            return None
+        try:
+            info = json.loads(subprocess.check_output(
+                [probe, "-v", "error", "-show_entries", "format=duration",
+                 "-of", "json", str(path)],
+                text=True, encoding="utf-8", errors="replace", **no_window_kwargs()))
+            d = float(info.get("format", {}).get("duration") or 0)
+            return d if d > 0 else None
+        except Exception:
+            return None
+
+    def _concat_command(self, parts, dst):
+        list_path = dst.with_name(f"{dst.stem}.resume-concat.txt")
+        with open(list_path, "w", encoding="utf-8") as f:
+            for p in parts:
+                # FFmpeg's concat-demuxer list format, not a shell - a
+                # literal single quote inside the path is escaped by
+                # closing the quote, emitting an escaped quote, and
+                # reopening it (the same trick as POSIX shell quoting,
+                # which is where this convention comes from).
+                escaped = str(p.resolve()).replace("'", r"'\''")
+                f.write(f"file '{escaped}'\n")
+        cmd = [exe("ffmpeg"), "-hide_banner", "-y", "-f", "concat", "-safe", "0",
+               "-i", str(list_path), "-map", "0", "-c", "copy",
+               *self.container_args_ffmpeg(str(dst)), str(dst)]
+        return cmd, list_path
+
+    def _offer_resume(self, active_path):
+        """Called from _on_finished() on a failed run. Returns True if a
+        resume segment (or a fresh restart) was launched in response, in
+        which case the caller should treat this _on_finished() call as
+        superseded rather than a final failure."""
+        if self.using_hb:
+            return False  # resume only implemented for the FFmpeg backend
+        # These already have a specific, actionable explanation of their
+        # own (switch container / switch encoder / turn off hwaccel) -
+        # resuming with the exact same settings would just fail again at
+        # (or near) the same spot, so don't pile a second dialog on top.
+        if self._mp4_track_error_seen or self._hw_encoder_error_seen or self._hw_decode_error_seen:
+            return False
+        threshold = max(20.0, (self.duration or 0) * 0.03)
+        segment_progress = self.current_out_sec - self._resume_progress_offset
+        if segment_progress < threshold or not active_path.is_file():
+            if self._resume_parts:
+                # A chained resume attempt that failed almost immediately -
+                # resuming again is unlikely to help, but the earlier,
+                # successfully-encoded part(s) are still good and shouldn't
+                # be thrown away silently.
+                parts_list = "\n".join(f"  {p}" for p in self._resume_parts)
+                self.write(
+                    "[resume] This segment failed almost immediately, so resuming "
+                    "again probably won't help. The earlier part(s) were kept, not "
+                    f"deleted:\n{parts_list}\n")
+            return False
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Resume conversion?")
+        dur_text = format_time(self.duration) if self.duration else "the end"
+        box.setText(
+            f"The conversion got to about {format_time(self.current_out_sec)} of "
+            f"{dur_text} before failing.\n\n"
+            "Resume picks up from close to that point instead of re-encoding "
+            "the whole file again from the start. The parts get joined into "
+            "the same output file once the rest finishes.")
+        resume_btn = box.addButton("Resume from here", QMessageBox.ButtonRole.AcceptRole)
+        restart_btn = box.addButton("Start over", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(resume_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is resume_btn:
+            self._begin_resume(active_path)
+            return True
+        if clicked is restart_btn:
+            # Get rid of this attempt's leftovers so start() doesn't have
+            # to guess whether a stray file next to the real output is safe
+            # to delete - it always is at this point, nothing else refers
+            # to it.
+            try:
+                active_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            for p in self._resume_parts:
+                try:
+                    p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            self._reset_resume_state()
+            QTimer.singleShot(0, self.start)
+            return True
+        return False
+
+    def _begin_resume(self, active_path):
+        final_dst = self._resume_final_dst or Path(self.dst_edit.text())
+        self._resume_final_dst = final_dst
+        part_num = len(self._resume_parts) + 1
+        part_path = final_dst.with_name(f"{final_dst.stem}.resume-part{part_num}{final_dst.suffix}")
+        try:
+            if part_path.exists():
+                part_path.unlink()
+            active_path.replace(part_path)
+        except OSError as e:
+            QMessageBox.critical(self, "Resume failed",
+                                  f"Could not prepare the partial file for resuming: {e}")
+            self._reset_resume_state()
+            return
+        real_dur = self._probe_duration(part_path)
+        base_offset = self._resume_progress_offset
+        # Prefer the real muxed duration of the part we just produced over
+        # the -progress estimate (see _probe_duration), and back off a
+        # further few seconds as a safety margin in case the very last GOP
+        # was still being written when the process was interrupted - a tiny
+        # bit of re-encoded overlap at the join is harmless, a gap isn't.
+        segment_dur = real_dur if real_dur is not None else max(0.0, self.current_out_sec - base_offset)
+        margin = 4.0
+        next_resume_sec = max(0.0, base_offset + segment_dur - margin)
+        self._resume_parts.append(part_path)
+        self._resume_output_override = final_dst.with_name(
+            f"{final_dst.stem}.resume-part{part_num + 1}{final_dst.suffix}")
+        self._resume_seek_sec = next_resume_sec
+        self._resume_progress_offset = next_resume_sec
+        self.write(f"[resume] Kept {part_path.name} as part {part_num}; continuing from "
+                   f"{format_time(next_resume_sec)}.\n")
+        self._start_resume_segment()
+
+    def _start_resume_segment(self):
+        self.stopping = False
+        self.paused = False
+        self.pbar.setValue(0)
+        self.speed_label.setText("")
+        self.speed_label.hide()
+        self.out_buf = ""
+        self.block = {}
+        self._mp4_track_error_seen = False
+        self._hw_encoder_error_seen = False
+        self._hw_decode_error_seen = False
+        self._current_encoder_label = self.encoder_combo.currentText()
+        self._hwaccel_decode_on = self.hwaccel_chk.isChecked()
+        # No live preview for resume segments - it's not worth the extra
+        # ffmpeg output branch for what's typically just the last stretch
+        # of a source, and preview state (preview_mtime etc.) is still
+        # sitting at wherever the failed segment left it.
+        self.preview_path = None
+        self.preview_label.setText("Live preview isn't available while resuming a failed conversion.")
+        self._set_preview_meta("")
+        cmd = self.command_ffmpeg()
+        self._launch(cmd)
+
+    def _start_concat_phase(self):
+        final_dst = self._resume_final_dst
+        parts = list(self._resume_parts)
+        self.write(f"[resume] All segments encoded \u2014 joining {len(parts)} part(s) into "
+                   f"{final_dst.name}\u2026\n")
+        cmd, list_path = self._concat_command(parts, final_dst)
+        self._concat_list_path = list_path
+        self._concat_phase = True
+        self._launch(cmd)
+
+    def _on_concat_finished(self, exit_code, exit_status):
+        self._concat_phase = False
+        self.proc = None
+        self.proc_psutil = None
+        was_stopping = self.stopping
+        self.stopping = False
+        self.paused = False
+        ok = (not was_stopping) and exit_code == 0 and exit_status == QProcess.ExitStatus.NormalExit
+        if self._concat_list_path is not None:
+            try:
+                self._concat_list_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        final_dst = self._resume_final_dst or Path(self.dst_edit.text())
+        parts = list(self._resume_parts)
+        if ok:
+            self.write("\nFinished successfully (resumed).\n")
+            for p in parts:
+                try:
+                    p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            self._reset_resume_state()
+            self.pbar.setValue(1000)
+            self.set_state("done", "Done \u00b7 saved to output")
+            self._validate_output(final_dst)
+            self._append_history_entry(self.src_edit.text(), final_dst, "done", self.kind)
+            self.update_run_controls()
+            if self.queue_running:
+                QTimer.singleShot(250, self._start_next_queue_item)
+            else:
+                self._notify_completion(True, f"Finished converting {final_dst.name}.")
+        else:
+            reason = "Join cancelled by user.\n" if was_stopping else "Failed to join the resumed segments; see log.\n"
+            self.write("\n" + reason)
+            parts_list = "\n".join(f"  {p}" for p in parts)
+            self.write(f"[resume] The already-encoded segment(s) were kept so nothing is lost:\n"
+                       f"{parts_list}\n"
+                       f"They use identical codec settings, so they can be joined manually "
+                       f"(e.g. with FFmpeg's concat demuxer or mkvmerge) if needed.\n")
+            QMessageBox.critical(
+                self, "Could not join resumed segments",
+                "Encoding finished, but joining the segments into the final file failed.\n\n"
+                "Nothing was lost \u2014 the encoded part files are still on disk:\n\n"
+                + parts_list +
+                "\n\nYou can join them manually (they share identical codec settings), or "
+                "delete them and start the conversion over.")
+            self._reset_resume_state()
+            self.set_state("error", "Failed \u2014 see activity log")
+            self._append_history_entry(
+                self.src_edit.text(), final_dst, "stopped" if was_stopping else "failed", self.kind)
+            self.update_run_controls()
+            if self.queue_running:
+                self.queue_running = False
+                if was_stopping:
+                    self.write("[queue] Stopped by user.\n")
+                else:
+                    self.write("[queue] Stopped because one item failed.\n")
+                    self._notify_completion(False, f"Queue stopped: joining {final_dst.name}'s segments failed.")
+            elif not was_stopping:
+                self._notify_completion(False, f"Failed to join the resumed segments for {final_dst.name}.")
 
     def _validate_output(self, output):
         """Fast post-flight check: verify the muxed file exists, has a video
@@ -3488,11 +4441,26 @@ Write-Output '[setup] Portable tools are ready.'
 
     # ---- short test-clip render -----------------------------------
     def _test_clip_command(self, out_path):
-        """A ~5s real encode through the exact backend/settings that will
+        """A short real encode through the exact backend/settings that will
         be used for the real conversion, so - unlike the instant still
         frame above - it also stands in for a live preview on the
-        HandBrake backend and shows motion/real encoded quality."""
-        seek = max(0.0, (self.duration or 10.0) / 2 - 2.5)
+        HandBrake backend and shows motion/real encoded quality.
+
+        Duration comes from test_clip_duration_spin (seconds) rather than
+        a fixed 5s, so a track-switching or A/V-sync issue that only shows
+        up past the first few seconds can actually be reproduced here.
+
+        Also maps every audio/subtitle track via the same
+        _ffmpeg_track_args()/_ffmpeg_track_codec_args() helpers the full
+        conversion uses (FFmpeg backend), instead of ffmpeg's implicit
+        "one best audio stream" default-stream-selection - a source with
+        several audio tracks (dubs, commentary, a lossless main track
+        alongside compatibility tracks) needs all of them present in the
+        test clip to actually test track switching, not just the one
+        ffmpeg happens to pick on its own.
+        """
+        dur = self.test_clip_duration_spin.value()
+        seek = max(0.0, (self.duration or float(dur) * 2) / 2 - dur / 2)
         using_hb = self.backend_combo.currentText().startswith("HandBrake")
         src = self.src_edit.text()
         if using_hb:
@@ -3502,7 +4470,8 @@ Write-Output '[setup] Portable tools are ready.'
             e = ids.get(depth) or ids.get("8-bit (SDR standard)")
             cmd = [self.handbrake_tool, "-i", src, "-o", str(out_path),
                    "-e", e, "-q", str(self.quality_spin.value()), "-M", "709", "-E", "copy",
-                   "--start-at", f"duration:{seek:.1f}", "--stop-at", "duration:5"]
+                   "--start-at", f"duration:{seek:.1f}", "--stop-at", f"duration:{dur}",
+                   "--all-audio", "--all-subtitles"]
             engine, code = self.tonemap_lookup()
             if engine == "cpu":
                 cmd += ["--colorspace", f"transfer=bt709:tonemap={code}:desat=0"]
@@ -3521,8 +4490,9 @@ Write-Output '[setup] Portable tools are ready.'
         cmd = [exe("ffmpeg"), "-hide_banner", "-y"]
         if self.hwaccel_chk.isChecked():
             cmd += ["-hwaccel", "auto"]
-        cmd += ["-ss", f"{seek:.2f}", "-i", src, "-t", "5", "-vf", vf,
-                "-c:v", e, *opt, "-pix_fmt", fmt, "-c:a", "copy",
+        cmd += ["-ss", f"{seek:.2f}", "-i", src, "-t", str(dur),
+                "-map", "0:v:0", *self._ffmpeg_track_args(), "-vf", vf,
+                "-c:v", e, *opt, "-pix_fmt", fmt, *self._ffmpeg_track_codec_args(),
                 *self.container_args_ffmpeg(out_path), str(out_path)]
         return cmd
 
@@ -3547,12 +4517,14 @@ Write-Output '[setup] Portable tools are ready.'
             # Second click while one is running: treat it as cancel.
             self._test_clip_proc.kill()
             self._test_clip_proc = None
-            self.test_clip_btn.setText("Render 5s test")
+            self.test_clip_btn.setText("Render test clip")
             set_role(self.test_clip_btn, "panel-toggle")
-            self.test_clip_btn.setToolTip(
-                "Render 5s test clip \u2014 encode a short real clip from the middle of the "
+            self.test_clip_btn.setToolTip(self.tr(
+                "Render test clip \u2014 encode a short real clip from the middle of the "
                 "source with the current settings, through the backend that will be used "
-                "for the full conversion, so you can check quality and motion first.")
+                "for the full conversion (including every audio/subtitle track, exactly "
+                "like the full conversion), so you can check quality, motion, and track "
+                "playback first."))
             self._set_test_clip_status("Test clip render cancelled.")
             return
         if self.proc is not None and self.proc.state() == QProcess.ProcessState.Running:
@@ -3596,23 +4568,26 @@ Write-Output '[setup] Portable tools are ready.'
         self._test_clip_out = None
         self.test_clip_open_btn.setEnabled(False)
         set_role(self.test_clip_open_btn, "panel-toggle")
-        self.test_clip_open_btn.setToolTip(
-            "Open test clip \u2014 no test clip rendered yet. Turns green once one is ready to play.")
+        self.test_clip_open_btn.setToolTip(self.tr(
+            "Open test clip \u2014 no test clip rendered yet. Turns green once one is ready to play."))
         self.test_clip_btn.setText("Cancel test")
         set_role(self.test_clip_btn, "stop-ready")
-        self.test_clip_btn.setToolTip("Cancel the test clip render currently in progress.")
-        self._set_test_clip_status("Rendering a 5s test clip with the current settings\u2026")
+        self.test_clip_btn.setToolTip(self.tr("Cancel the test clip render currently in progress."))
+        dur = self.test_clip_duration_spin.value()
+        self._set_test_clip_status(f"Rendering a {dur}s test clip with the current settings\u2026")
         proc.start()
 
     def _on_test_clip_finished(self, out):
         was_current = self._test_clip_proc is not None
         self._test_clip_proc = None
-        self.test_clip_btn.setText("Render 5s test")
+        self.test_clip_btn.setText("Render test clip")
         set_role(self.test_clip_btn, "panel-toggle")
-        self.test_clip_btn.setToolTip(
-            "Render 5s test clip \u2014 encode a short real clip from the middle of the "
+        self.test_clip_btn.setToolTip(self.tr(
+            "Render test clip \u2014 encode a short real clip from the middle of the "
             "source with the current settings, through the backend that will be used "
-            "for the full conversion, so you can check quality and motion first.")
+            "for the full conversion (including every audio/subtitle track, exactly "
+            "like the full conversion), so you can check quality, motion, and track "
+            "playback first."))
         if not was_current:
             return  # cancelled - out may be a half-written/deleted file
         if not out.exists() or out.stat().st_size == 0:
@@ -3621,7 +4596,7 @@ Write-Output '[setup] Portable tools are ready.'
         self._test_clip_out = out
         self.test_clip_open_btn.setEnabled(True)
         set_role(self.test_clip_open_btn, "panel-toggle")
-        self.test_clip_open_btn.setToolTip(f"Open test clip \u2014 ready: {out}")
+        self.test_clip_open_btn.setToolTip(self.tr("Open test clip \u2014 ready: {out}", out=out))
         self._set_test_clip_status("")
 
     def _open_test_clip(self):
