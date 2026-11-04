@@ -1,6 +1,6 @@
 # HDR to SDR Video Converter
 
-A desktop tone-mapping tool for people who care which curve they're using — standard FFmpeg, true BT.2390 on the GPU, or HandBrakeCLI, with the exact command always visible. H.264, H.265, and AV1 output, 10-bit and 12-bit included, visual side-by-side tone-mapping comparison, free.
+A desktop tone-mapping tool — standard FFmpeg, true BT.2390 on the GPU, or HandBrakeCLI, with the exact command always visible. H.264, H.265, and AV1 output, 10-bit and 12-bit included, visual side-by-side tone-mapping comparison, free.
 
 ![platform](https://img.shields.io/badge/platform-Windows-informational)
 ![python](https://img.shields.io/badge/python-3.10%2B-blue)
