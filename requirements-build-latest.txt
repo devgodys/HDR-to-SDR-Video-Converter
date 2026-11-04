@@ -1,0 +1,2 @@
+-r requirements-latest.txt
+pyinstaller

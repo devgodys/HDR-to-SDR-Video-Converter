@@ -1,0 +1,3 @@
+# Build tooling (PyInstaller) on top of the stable runtime pins.
+-r requirements-stable.in
+pyinstaller==6.22.3

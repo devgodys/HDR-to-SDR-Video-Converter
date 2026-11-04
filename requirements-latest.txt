@@ -1,0 +1,6 @@
+# "Latest" channel: whatever is newest on PyPI today (no pins, no hashes), so
+# problems with new PySide6 / psutil releases show up early - run
+#   python tools/deps.py test --channel latest
+# The stable channel (requirements-stable.txt) is what releases are built from.
+PySide6
+psutil

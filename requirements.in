@@ -1,0 +1,6 @@
+# Runtime dependencies, as loosely as the code allows. Do not install from this
+# file directly - use one of the two channels (see DEPENDENCIES.md):
+#   requirements-stable.txt   pinned versions + SHA-256 hashes (the default)
+#   requirements-latest.txt   whatever is newest on PyPI today
+PySide6>=6.12
+psutil>=5.9
